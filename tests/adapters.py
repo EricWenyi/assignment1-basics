@@ -14,6 +14,75 @@ from torch import Tensor
 import torch.nn as nn
 
 
+class Embedding(nn.Module):
+    """
+    An Embedding module that performs embedding table lookup for token IDs.
+    
+    This class implements an embedding layer that converts discrete token IDs into
+    dense vector representations. Each token ID is mapped to a learned embedding vector.
+    
+    The embedding table is a learnable parameter matrix where each row represents 
+    the embedding vector for a specific token in the vocabulary.
+    
+    Args:
+        num_embeddings (int): Size of the vocabulary (number of possible token IDs)
+        embedding_dim (int): Dimension of the embedding vectors (d_model)
+        device (torch.device | None): Device to place the parameters on (CPU/GPU)
+        dtype (torch.dtype | None): Data type for the parameters (float32, float64, etc.)
+    """
+
+    def __init__(self, num_embeddings, embedding_dim, device=None, dtype=None):
+        # Call the parent class constructor to properly initialize the nn.Module
+        # This sets up important internal state for parameter tracking and gradient computation
+        super().__init__()
+
+        # Store the dimensions for reference and validation
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+
+        # Create the embedding weight matrix with shape (num_embeddings, embedding_dim)
+        # Each row represents the embedding vector for a specific token ID
+        # The final dimension is embedding_dim (d_model) as specified in instructions
+        # nn.Parameter wraps a tensor and tells PyTorch this is a learnable parameter
+        # that should be included in gradients and optimizer updates
+        self.weight = nn.Parameter(torch.empty(num_embeddings, embedding_dim, device=device, dtype=dtype))
+
+        # Initialize the embedding weights using truncated normal distribution
+        # This initialization helps with stable training and prevents vanishing/exploding gradients
+        # trunc_normal_ initializes values from a truncated normal distribution
+        torch.nn.init.trunc_normal_(self.weight)
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Look up embedding vectors for the given token IDs.
+        
+        This method performs an embedding table lookup operation. For each token ID
+        in the input tensor, it retrieves the corresponding embedding vector from
+        the weight matrix.
+        
+        The operation is: output[..., i, :] = weight[token_ids[..., i], :]
+        where token_ids[..., i] is used as an index into the embedding table.
+        
+        Args:
+            token_ids (torch.Tensor): Input tensor of token IDs with shape (...,)
+                Each value should be an integer in range [0, num_embeddings-1]
+                The ... represents arbitrary leading dimensions (batch size, sequence length, etc.)
+                
+        Returns:
+            torch.Tensor: Output tensor of embeddings with shape (..., embedding_dim)
+                Same leading dimensions as input, with embedding_dim as the final dimension
+        """
+        # Perform embedding lookup using advanced indexing
+        # token_ids contains indices into the embedding table
+        # self.weight[token_ids] retrieves the embedding vectors for each token ID
+        # 
+        # For example:
+        # - token_ids shape: (batch_size, seq_len)  
+        # - weight shape: (num_embeddings, embedding_dim)
+        # - output shape: (batch_size, seq_len, embedding_dim)
+        return self.weight[token_ids]
+
+
 class Linear(nn.Module):
     """
     A Linear transformation module that applies a linear transformation to input data.
@@ -127,19 +196,42 @@ def run_embedding(
     token_ids: Int[Tensor, " ..."],
 ) -> Float[Tensor, " ... d_model"]:
     """
-    Given the weights of an Embedding layer, get the embeddings for a batch of token ids.
+    Test adapter function for the Embedding module.
+    
+    This function creates an Embedding layer with the specified vocabulary size and
+    embedding dimension, loads the provided weights into it, and applies it to the
+    input token IDs to retrieve the corresponding embedding vectors.
+    
+    The purpose is to test that our Embedding implementation can correctly
+    load pre-trained embedding weights and produce the expected embedding lookups.
 
     Args:
-        vocab_size (int): The number of embeddings in the vocabulary
-        d_model (int): The size of the embedding dimension
-        weights (Float[Tensor, "vocab_size d_model"]): The embedding vectors to fetch from
-        token_ids (Int[Tensor, "..."]): The set of token ids to fetch from the Embedding layer
+        vocab_size (int): The number of embeddings in the vocabulary (num_embeddings)
+        d_model (int): The size of the embedding dimension (embedding_dim)
+        weights (Float[Tensor, "vocab_size d_model"]): Pre-trained embedding weights to load
+            Shape is (vocab_size, d_model) matching our Embedding class's weight parameter shape
+        token_ids (Int[Tensor, "..."]): Input tensor of token IDs to look up embeddings for
+            Can have arbitrary leading dimensions (...) for batching and sequence length
 
     Returns:
-        Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
+        Float[Tensor, "... d_model"]: The embedding vectors for the input token IDs
+            Same leading dimensions as input, with d_model as the final dimension
     """
-
-    raise NotImplementedError
+    # Create an instance of our Embedding module with the specified dimensions
+    # We don't specify device/dtype, so it will use defaults (CPU, float32)
+    embedding_layer = Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
+    
+    # Load the provided weights into our embedding layer
+    # The weights tensor should have shape (vocab_size, d_model) which matches our weight parameter
+    # We use .data to directly assign without affecting gradients (since this is testing)
+    embedding_layer.weight.data = weights
+    
+    # Apply the embedding lookup to the input token IDs
+    # This calls our forward method which performs: weight[token_ids]
+    # PyTorch automatically handles the broadcasting for batch and sequence dimensions
+    output = embedding_layer(token_ids)
+    
+    return output
 
 
 def run_swiglu(
