@@ -1,3 +1,6 @@
+# type: ignore
+# pylint: disable=undefined-variable
+
 from __future__ import annotations
 
 import os
@@ -8,6 +11,69 @@ from jaxtyping import Float, Int
 import numpy.typing as npt
 import torch
 from torch import Tensor
+import torch.nn as nn
+
+
+class Linear(nn.Module):
+    """
+    A Linear transformation module that applies a linear transformation to input data.
+    
+    This class implements a linear layer (also known as a fully connected layer or dense layer)
+    that performs the operation: output = input @ W.T, where W is a learnable weight matrix.
+    
+    Unlike PyTorch's built-in nn.Linear, this implementation does not include a bias term.
+    
+    Args:
+        in_features (int): Size of each input sample (number of input features)
+        out_features (int): Size of each output sample (number of output features)  
+        device (torch.device | None): Device to place the parameters on (CPU/GPU)
+        dtype (torch.dtype | None): Data type for the parameters (float32, float64, etc.)
+    """
+    
+    def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
+        # Call the parent class constructor to properly initialize the nn.Module
+        # This sets up important internal state for parameter tracking and gradient computation
+        super().__init__()
+        
+        # Store the dimensions for reference and validation
+        self.in_features = in_features
+        self.out_features = out_features
+        
+        # Create the weight parameter W with shape (out_features, in_features)
+        # We store W (not W.T) for memory ordering efficiency as mentioned in instructions
+        # nn.Parameter wraps a tensor and tells PyTorch this is a learnable parameter
+        # that should be included in gradients and optimizer updates
+        self.W = nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
+        
+        # Initialize the weights using truncated normal distribution
+        # This initialization helps with stable training and prevents vanishing/exploding gradients
+        # trunc_normal_ initializes values from a truncated normal distribution
+        torch.nn.init.trunc_normal_(self.W)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply the linear transformation to the input tensor.
+        
+        The mathematical operation performed is: output = x @ W.T
+        where @ denotes matrix multiplication and W.T is the transpose of W.
+        
+        For input shape (..., in_features), the output shape will be (..., out_features).
+        The ... represents arbitrary leading dimensions (batch size, sequence length, etc.)
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (..., in_features)
+                The last dimension must match self.in_features
+                
+        Returns:
+            torch.Tensor: Output tensor of shape (..., out_features)
+                The transformation result with the same leading dimensions as input
+        """
+        # Perform matrix multiplication: x @ W.T
+        # x has shape (..., in_features) 
+        # W has shape (out_features, in_features)
+        # W.T has shape (in_features, out_features)
+        # Result has shape (..., out_features)
+        return x @ self.W.T
 
 
 def run_linear(
@@ -17,19 +83,41 @@ def run_linear(
     in_features: Float[Tensor, " ... d_in"],
 ) -> Float[Tensor, " ... d_out"]:
     """
-    Given the weights of a Linear layer, compute the transformation of a batched input.
+    Test adapter function for the Linear module.
+    
+    This function creates a Linear layer with the specified dimensions,
+    loads the provided weights into it, and applies it to the input features.
+    
+    The purpose is to test that our Linear implementation can correctly
+    load pre-trained weights and produce the expected output transformations.
 
     Args:
-        in_dim (int): The size of the input dimension
-        out_dim (int): The size of the output dimension
-        weights (Float[Tensor, "d_out d_in"]): The linear weights to use
-        in_features (Float[Tensor, "... d_in"]): The output tensor to apply the function to
+        d_in (int): The size of the input dimension (number of input features)
+        d_out (int): The size of the output dimension (number of output features)  
+        weights (Float[Tensor, "d_out d_in"]): Pre-trained linear weights to load
+            Shape is (d_out, d_in) matching our Linear class's W parameter shape
+        in_features (Float[Tensor, "... d_in"]): Input tensor to transform
+            Can have arbitrary leading dimensions (...) for batching
 
     Returns:
-        Float[Tensor, "... d_out"]: The transformed output of your linear module.
+        Float[Tensor, "... d_out"]: The transformed output tensor
+            Same leading dimensions as input, but last dimension is d_out
     """
-
-    raise NotImplementedError
+    # Create an instance of our Linear module with the specified dimensions
+    # We don't specify device/dtype, so it will use defaults (CPU, float32)
+    linear_layer = Linear(in_features=d_in, out_features=d_out)
+    
+    # Load the provided weights into our linear layer
+    # The weights tensor should have shape (d_out, d_in) which matches our W parameter
+    # We use .data to directly assign without affecting gradients (since this is testing)
+    linear_layer.W.data = weights
+    
+    # Apply the linear transformation to the input features
+    # This calls our forward method: in_features @ W.T
+    # PyTorch automatically handles the broadcasting for batch dimensions
+    output = linear_layer(in_features)
+    
+    return output
 
 
 def run_embedding(
