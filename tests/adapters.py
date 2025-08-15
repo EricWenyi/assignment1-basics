@@ -83,6 +83,184 @@ class Embedding(nn.Module):
         return self.weight[token_ids]
 
 
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization (RMSNorm) module.
+    
+    RMSNorm is a normalization technique that normalizes the input by the root mean square (RMS)
+    of the input elements. Unlike LayerNorm, RMSNorm does not subtract the mean, which makes it
+    simpler and often more stable for training large language models.
+    
+    The mathematical operation is:
+    output = (x / RMS(x)) * weight
+    where RMS(x) = sqrt(mean(x^2) + eps)
+    
+    Args:
+        d_model (int): Hidden dimension of the model (size of the last dimension)
+        eps (float): Small value added to denominator for numerical stability (default: 1e-5)
+        device (torch.device | None): Device to place the parameters on (CPU/GPU)
+        dtype (torch.dtype | None): Data type for the parameters (float32, float64, etc.)
+    """
+    
+    def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
+        # Call the parent class constructor to properly initialize the nn.Module
+        # This sets up important internal state for parameter tracking and gradient computation
+        super().__init__()
+        
+        # Store the model dimension and epsilon for numerical stability
+        self.d_model = d_model
+        self.eps = eps
+        
+        # Create the learnable scale parameter (weight)
+        # This is a vector of size d_model that scales each feature dimension
+        # nn.Parameter wraps a tensor and tells PyTorch this is a learnable parameter
+        # that should be included in gradients and optimizer updates
+        self.weight = nn.Parameter(torch.empty(d_model, device=device, dtype=dtype))
+        
+        # Initialize the weights using truncated normal distribution
+        # This initialization helps with stable training and prevents vanishing/exploding gradients
+        # trunc_normal_ initializes values from a truncated normal distribution
+        torch.nn.init.trunc_normal_(self.weight)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply RMSNorm to the input tensor.
+        
+        This method normalizes the input by dividing by the RMS (root mean square) of the
+        input elements along the last dimension, then scales by learnable weights.
+        
+        The normalization is performed in float32 for numerical stability, then converted
+        back to the original dtype.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (..., d_model)
+                The last dimension must match self.d_model
+                Can have arbitrary leading dimensions (batch_size, sequence_length, etc.)
+                
+        Returns:
+            torch.Tensor: Output tensor of same shape as input (..., d_model)
+                The normalized and scaled tensor
+        """
+        # Store the original dtype to convert back later
+        input_dtype = x.dtype
+        
+        # Upcast to float32 for numerical stability during normalization
+        # This prevents precision issues that can occur with float16/bfloat16
+        x = x.to(torch.float32)
+        
+        # Compute the root mean square (RMS) along the last dimension
+        # Step 1: Square all elements: x^2
+        x_squared = x * x
+        
+        # Step 2: Compute mean along the last dimension (d_model), keeping dimensions
+        # keepdim=True preserves the dimension for broadcasting
+        mean_squared = torch.mean(x_squared, dim=-1, keepdim=True)
+        
+        # Step 3: Add epsilon for numerical stability and take square root to get RMS
+        # eps prevents division by zero when all elements are zero
+        rms = torch.sqrt(mean_squared + self.eps)
+        
+        # Normalize by dividing by RMS
+        # This makes the RMS of the normalized vector equal to 1
+        normalized = x / rms
+        
+        # Scale by learnable weight parameters
+        # The weight vector is broadcast across all dimensions except the last
+        # normalized shape: (..., d_model)
+        # self.weight shape: (d_model,)
+        # Result shape: (..., d_model)
+        output = normalized * self.weight
+        
+        # Convert back to original dtype
+        # This is important for mixed precision training and memory efficiency
+        output = output.to(input_dtype)
+        
+        return output
+
+
+class SwiGLU(nn.Module):
+    """
+    SwiGLU (Swish-Gated Linear Unit) Feed-Forward Network.
+    
+    SwiGLU is a variant of GLU (Gated Linear Unit) that uses SiLU (Swish) activation.
+    It's commonly used in transformer models as the position-wise feed-forward network.
+    
+    The architecture consists of three linear transformations:
+    - W1: projects input from d_model to d_ff (gate projection)
+    - W2: projects from d_ff back to d_model (output projection)  
+    - W3: projects input from d_model to d_ff (value projection)
+    
+    The computation is: W2(SiLU(W1(x)) ⊙ W3(x))
+    where ⊙ represents element-wise multiplication (gating mechanism)
+    
+    Args:
+        d_model (int): Input and output dimension (hidden size)
+        d_ff (int): Inner feed-forward dimension (typically ~8/3 * d_model)
+        device (torch.device | None): Device to place the parameters on
+        dtype (torch.dtype | None): Data type for the parameters
+    """
+    
+    def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
+        # Call the parent class constructor to properly initialize the nn.Module
+        # This sets up important internal state for parameter tracking and gradient computation
+        super().__init__()
+        
+        # Store dimensions for reference
+        self.d_model = d_model
+        self.d_ff = d_ff
+        
+        # Create the three linear transformations used in SwiGLU
+        # W1: Gate projection - transforms input to intermediate dimension with SiLU activation
+        self.w1 = Linear(in_features=d_model, out_features=d_ff, device=device, dtype=dtype)
+        
+        # W2: Output projection - transforms intermediate dimension back to output dimension
+        self.w2 = Linear(in_features=d_ff, out_features=d_model, device=device, dtype=dtype)
+        
+        # W3: Value projection - transforms input to intermediate dimension (no activation)
+        self.w3 = Linear(in_features=d_model, out_features=d_ff, device=device, dtype=dtype)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply SwiGLU feed-forward transformation to the input.
+        
+        The computation follows this pattern:
+        1. Gate path: W1(x) -> SiLU activation
+        2. Value path: W3(x) -> no activation  
+        3. Element-wise multiplication (gating): SiLU(W1(x)) ⊙ W3(x)
+        4. Output projection: W2(gated_result)
+        
+        This gating mechanism allows the network to selectively pass information,
+        where the SiLU-activated gate controls what information from the value path
+        gets passed through.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (..., d_model)
+                Can have arbitrary leading dimensions (batch_size, sequence_length, etc.)
+                
+        Returns:
+            torch.Tensor: Output tensor of shape (..., d_model)
+                Same leading dimensions as input, with d_model as final dimension
+        """
+        # Gate path: Apply W1 linear transformation and SiLU activation
+        # W1 projects from d_model to d_ff, then SiLU provides non-linearity
+        gate = run_silu(self.w1(x))  # Shape: (..., d_ff)
+        
+        # Value path: Apply W3 linear transformation (no activation)
+        # W3 also projects from d_model to d_ff
+        value = self.w3(x)  # Shape: (..., d_ff)
+        
+        # Gating mechanism: Element-wise multiplication
+        # The SiLU-activated gate controls which information from value gets passed
+        # This is the key innovation of GLU - selective information flow
+        gated = gate * value  # Shape: (..., d_ff)
+        
+        # Output projection: Apply W2 to project back to original dimension
+        # W2 projects from d_ff back to d_model
+        output = self.w2(gated)  # Shape: (..., d_model)
+        
+        return output
+
+
 class Linear(nn.Module):
     """
     A Linear transformation module that applies a linear transformation to input data.
@@ -242,28 +420,57 @@ def run_swiglu(
     w3_weight: Float[Tensor, " d_ff d_model"],
     in_features: Float[Tensor, " ... d_model"],
 ) -> Float[Tensor, " ... d_model"]:
-    """Given the weights of a SwiGLU network, return
-    the output of your implementation with these weights.
+    """
+    Test adapter function for the SwiGLU feed-forward network.
+    
+    This function creates a SwiGLU network with the specified dimensions,
+    loads the provided weights into the three linear layers (W1, W2, W3),
+    and applies the SwiGLU transformation to the input features.
+    
+    The purpose is to test that our SwiGLU implementation can correctly
+    load pre-trained weights and produce the expected feed-forward output.
 
     Args:
-        d_model (int): Dimensionality of the feedforward input and output.
-        d_ff (int): Dimensionality of the up-project happening internally to your swiglu.
-        w1_weight (Float[Tensor, "d_ff d_model"]): Stored weights for W1
-        w2_weight (Float[Tensor, "d_model d_ff"]): Stored weights for W2
-        w3_weight (Float[Tensor, "d_ff d_model"]): Stored weights for W3
-        in_features (Float[Tensor, "... d_model"]): Input embeddings to the feed-forward layer.
+        d_model (int): Dimensionality of the feedforward input and output (hidden size).
+        d_ff (int): Dimensionality of the intermediate projection (typically ~8/3 * d_model).
+        w1_weight (Float[Tensor, "d_ff d_model"]): Pre-trained weights for W1 (gate projection)
+            Shape is (d_ff, d_model) - projects input to intermediate dimension
+        w2_weight (Float[Tensor, "d_model d_ff"]): Pre-trained weights for W2 (output projection)
+            Shape is (d_model, d_ff) - projects intermediate back to output dimension
+        w3_weight (Float[Tensor, "d_ff d_model"]): Pre-trained weights for W3 (value projection)  
+            Shape is (d_ff, d_model) - projects input to intermediate dimension
+        in_features (Float[Tensor, "... d_model"]): Input embeddings to the feed-forward layer
+            Can have arbitrary leading dimensions (...) for batching and sequence length
 
     Returns:
-        Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
+        Float[Tensor, "... d_model"]: Output embeddings with same shape as input
+            The result of applying SwiGLU: W2(SiLU(W1(x)) ⊙ W3(x))
     """
-    # Example:
-    # If your state dict keys match, you can use `load_state_dict()`
-    # swiglu.load_state_dict(weights)
-    # You can also manually assign the weights
-    # swiglu.w1.weight.data = w1_weight
-    # swiglu.w2.weight.data = w2_weight
-    # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    # Create an instance of our SwiGLU feed-forward network
+    # We don't specify device/dtype, so it will use defaults (CPU, float32)
+    swiglu = SwiGLU(d_model=d_model, d_ff=d_ff)
+    
+    # Load the provided weights into the three linear layers
+    # Each weight tensor matches the expected shape for the corresponding layer
+    
+    # W1 (gate projection): d_model -> d_ff, so weight shape is (d_ff, d_model)
+    swiglu.w1.W.data = w1_weight
+    
+    # W2 (output projection): d_ff -> d_model, so weight shape is (d_model, d_ff)  
+    swiglu.w2.W.data = w2_weight
+    
+    # W3 (value projection): d_model -> d_ff, so weight shape is (d_ff, d_model)
+    swiglu.w3.W.data = w3_weight
+    
+    # Apply the SwiGLU transformation to the input features
+    # This calls our forward method which performs:
+    # 1. Gate path: SiLU(W1(x))
+    # 2. Value path: W3(x) 
+    # 3. Gating: SiLU(W1(x)) * W3(x)
+    # 4. Output: W2(gated_result)
+    output = swiglu(in_features)
+    
+    return output
 
 
 def run_scaled_dot_product_attention(
@@ -544,35 +751,77 @@ def run_rmsnorm(
     weights: Float[Tensor, " d_model"],
     in_features: Float[Tensor, " ... d_model"],
 ) -> Float[Tensor, " ... d_model"]:
-    """Given the weights of a RMSNorm affine transform,
-    return the output of running RMSNorm on the input features.
+    """
+    Test adapter function for the RMSNorm module.
+    
+    This function creates an RMSNorm layer with the specified dimensions and epsilon,
+    loads the provided weights into it, and applies it to the input features to
+    perform root mean square normalization.
+    
+    The purpose is to test that our RMSNorm implementation can correctly
+    load pre-trained normalization weights and produce the expected normalized output.
 
     Args:
-        d_model (int): The dimensionality of the RMSNorm input.
-        eps: (float): A value added to the denominator for numerical stability.
-        weights (Float[Tensor, "d_model"]): RMSNorm weights.
-        in_features (Float[Tensor, "... d_model"]): Input features to run RMSNorm on. Can have arbitrary leading
-            dimensions.
+        d_model (int): The dimensionality of the RMSNorm input (hidden dimension).
+        eps (float): A value added to the denominator for numerical stability.
+        weights (Float[Tensor, "d_model"]): Pre-trained RMSNorm scale weights to load
+            Shape is (d_model,) matching our RMSNorm class's weight parameter shape
+        in_features (Float[Tensor, "... d_model"]): Input features to normalize
+            Can have arbitrary leading dimensions (...) for batching and sequence length
+            The last dimension must be d_model
 
     Returns:
-        Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
-        RMSNorm of the `in_features`.
+        Float[Tensor, "... d_model"]: Tensor with the same shape as `in_features` 
+            containing the RMSNorm-normalized output
     """
-    raise NotImplementedError
+    # Create an instance of our RMSNorm module with the specified dimensions and epsilon
+    # We don't specify device/dtype, so it will use defaults (CPU, float32)
+    rmsnorm_layer = RMSNorm(d_model=d_model, eps=eps)
+    
+    # Load the provided weights into our RMSNorm layer
+    # The weights tensor should have shape (d_model,) which matches our weight parameter
+    # We use .data to directly assign without affecting gradients (since this is testing)
+    rmsnorm_layer.weight.data = weights
+    
+    # Apply RMSNorm to the input features
+    # This calls our forward method which performs:
+    # 1. Upcast to float32 for numerical stability
+    # 2. Compute RMS: sqrt(mean(x^2) + eps)
+    # 3. Normalize: x / RMS
+    # 4. Scale: normalized * weight
+    # 5. Downcast back to original dtype
+    output = rmsnorm_layer(in_features)
+    
+    return output
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
-    """Given a tensor of inputs, return the output of applying SiLU
-    to each element.
+    """
+    Apply SiLU (Sigmoid Linear Unit) activation function element-wise to the input tensor.
+    
+    SiLU is also known as Swish activation function. It's defined as:
+    SiLU(x) = x * sigmoid(x) = x * (1 / (1 + exp(-x)))
+    
+    This activation function is smooth, non-monotonic, and has been shown to work well
+    in deep networks, particularly in transformer models.
 
     Args:
-        in_features(Float[Tensor, "..."]): Input features to run SiLU on. Shape is arbitrary.
+        in_features (Float[Tensor, "..."]): Input features to apply SiLU activation to.
+            Can have arbitrary shape - the activation is applied element-wise.
 
     Returns:
-        Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
-        SiLU to each element.
+        Float[Tensor, "..."]: Output tensor with same shape as input, with SiLU applied
+        to each element.
     """
-    raise NotImplementedError
+    # SiLU(x) = x * sigmoid(x)
+    # We use torch.sigmoid for numerical stability as recommended in the instructions
+    # sigmoid(x) = 1 / (1 + exp(-x)) - this is computed stably by torch.sigmoid
+    # 
+    # The multiplication x * sigmoid(x) gives us the SiLU activation:
+    # - For large positive x: sigmoid(x) ≈ 1, so SiLU(x) ≈ x (linear behavior)
+    # - For large negative x: sigmoid(x) ≈ 0, so SiLU(x) ≈ 0 (saturates to zero)
+    # - Around x = 0: provides smooth transition with some negative values allowed
+    return in_features * torch.sigmoid(in_features)
 
 
 def run_get_batch(
