@@ -990,18 +990,55 @@ def run_get_batch(
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
     """
-    Given a tensor of inputs, return the output of softmaxing the given `dim`
-    of the input.
+    Apply softmax operation to a specified dimension of the input tensor with numerical stability.
+    
+    Softmax converts unnormalized scores to a probability distribution:
+    softmax(v)_i = exp(v_i) / Σ_j exp(v_j)
+    
+    For numerical stability, we use the mathematically equivalent but stable formulation:
+    softmax(v)_i = exp(v_i - max(v)) / Σ_j exp(v_j - max(v))
+    
+    This prevents overflow by ensuring the maximum exponent is 0, since:
+    exp(v_i - max(v)) ≤ exp(0) = 1
 
     Args:
-        in_features (Float[Tensor, "..."]): Input features to softmax. Shape is arbitrary.
-        dim (int): Dimension of the `in_features` to apply softmax to.
+        in_features (Float[Tensor, "..."]): Input tensor to apply softmax to.
+            Can have arbitrary shape - softmax is applied along the specified dimension.
+        dim (int): Dimension to apply softmax along.
+            Must be a valid dimension index for the input tensor.
 
     Returns:
-        Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
-        softmax normalizing the specified `dim`.
+        Float[Tensor, "..."]: Output tensor with same shape as input.
+            Values along the specified dimension form probability distributions (sum to 1).
     """
-    raise NotImplementedError
+    # Step 1: Find the maximum value along the specified dimension for numerical stability
+    # keepdim=True preserves the dimension so we can broadcast for subtraction
+    # This max value will be subtracted from all elements to prevent overflow
+    max_vals = torch.max(in_features, dim=dim, keepdim=True)[0]  # Shape: same as input except dim has size 1
+    
+    # Step 2: Subtract the maximum value for numerical stability
+    # This ensures the largest value becomes 0, preventing exp() from overflowing
+    # Since softmax(v + c) = softmax(v) for any constant c, this doesn't change the result
+    stable_input = in_features - max_vals  # Shape: same as input
+    
+    # Step 3: Apply the exponential function
+    # Now all values are ≤ 0, so exp(values) ≤ 1, preventing overflow
+    exp_values = torch.exp(stable_input)  # Shape: same as input
+    
+    # Step 4: Sum the exponential values along the specified dimension
+    # keepdim=True preserves the dimension for broadcasting in the division step
+    sum_exp = torch.sum(exp_values, dim=dim, keepdim=True)  # Shape: same as input except dim has size 1
+    
+    # Step 5: Normalize by dividing each exp value by the sum
+    # This creates a probability distribution along the specified dimension
+    softmax_output = exp_values / sum_exp  # Shape: same as input
+    
+    # Verify the mathematical properties:
+    # 1. All values are ≥ 0 (since exp() is always positive)
+    # 2. Values along dim sum to 1 (due to normalization)
+    # 3. Larger input values get larger probabilities (monotonic property preserved)
+    
+    return softmax_output
 
 
 def run_cross_entropy(
