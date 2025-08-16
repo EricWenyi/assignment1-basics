@@ -261,6 +261,121 @@ class SwiGLU(nn.Module):
         return output
 
 
+class RotaryPositionalEmbedding(nn.Module):
+    """
+    Rotary Positional Embedding (RoPE) module.
+    
+    RoPE applies pairwise rotation matrices to query and key vectors based on their position.
+    For a query token q(i) at position i, we apply rotation matrix Ri giving q'(i) = Ri * q(i).
+    
+    The rotation matrix Ri is block-diagonal with 2x2 rotation blocks:
+    - Each block Ri_k rotates embedding elements q(i)[2k-1:2k] by angle θi,k = i / Θ^((2k-1)/d)
+    - Ri_k = [[cos(θi,k), -sin(θi,k)], [sin(θi,k), cos(θi,k)]]
+    - Full matrix Ri has blocks Ri_1, Ri_2, ..., Ri_(d/2) on the diagonal
+    
+    This implementation efficiently applies the rotation without constructing the full d×d matrix.
+    
+    Args:
+        theta (float): Base frequency parameter Θ (typically 10000)
+        d_k (int): Dimension of query/key vectors (must be even)
+        max_seq_len (int): Maximum sequence length for precomputing cos/sin values
+        device (torch.device | None): Device to store the precomputed buffers
+    """
+    
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
+        # Call the parent class constructor to properly initialize the nn.Module
+        super().__init__()
+        
+        # Store parameters for reference
+        self.theta = theta
+        self.d_k = d_k
+        self.max_seq_len = max_seq_len
+        
+        # Ensure d_k is even since RoPE works on pairs of dimensions
+        assert d_k % 2 == 0, f"d_k must be even for RoPE, got {d_k}"
+        
+        # Precompute rotation frequencies for each dimension pair k ∈ {1, ..., d/2}
+        # For pair k, we use dimensions [2k-1, 2k] (0-indexed: [2k-2, 2k-1])
+        # The frequency is: 1 / Θ^((2k-1)/d) = 1 / Θ^((2*(k-1))/d) for k ∈ {1, ..., d/2}
+        # In 0-indexed terms: 1 / Θ^(2*k/d) for k ∈ {0, 1, ..., d/2-1}
+        k = torch.arange(0, d_k // 2, dtype=torch.float32, device=device)
+        freqs = 1.0 / (theta ** (2.0 * k / d_k))  # Shape: (d_k/2,)
+        
+        # Precompute positions for the maximum sequence length
+        # positions = [0, 1, 2, ..., max_seq_len-1]
+        positions = torch.arange(max_seq_len, dtype=torch.float32, device=device)  # Shape: (max_seq_len,)
+        
+        # Compute the rotation angles for all position-frequency combinations
+        # θi,k = position_i * frequency_k
+        angles = torch.outer(positions, freqs)  # Shape: (max_seq_len, d_k/2)
+        
+        # Precompute cosine and sine values for all angles
+        # These will be used in the 2x2 rotation matrices
+        cos_cached = torch.cos(angles)  # Shape: (max_seq_len, d_k/2)
+        sin_cached = torch.sin(angles)  # Shape: (max_seq_len, d_k/2)
+        
+        # Register as non-persistent buffers (not saved in state_dict but moved with module)
+        # These are precomputed values, not learnable parameters
+        self.register_buffer('cos_cached', cos_cached, persistent=False)
+        self.register_buffer('sin_cached', sin_cached, persistent=False)
+    
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        """
+        Apply RoPE rotation to the input tensor efficiently.
+        
+        Instead of constructing the full block-diagonal matrix Ri, we directly apply
+        the pairwise rotations to consecutive dimension pairs.
+        
+        For each pair of dimensions [2k-1, 2k] (0-indexed: [2k, 2k+1]):
+        - Extract x_even = x[..., 2k] and x_odd = x[..., 2k+1] 
+        - Apply rotation: 
+          rotated_even = x_even * cos(θi,k) - x_odd * sin(θi,k)
+          rotated_odd = x_even * sin(θi,k) + x_odd * cos(θi,k)
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (..., seq_len, d_k)
+                Query or key vectors to apply RoPE to
+            token_positions (torch.Tensor): Token positions of shape (..., seq_len)
+                Position indices for each token in the sequence
+                
+        Returns:
+            torch.Tensor: Rotated tensor of same shape (..., seq_len, d_k)
+        """
+        # Extract cos and sin values for the given token positions
+        # token_positions shape: (..., seq_len)
+        # cos/sin shape after indexing: (..., seq_len, d_k/2)
+        cos = self.cos_cached[token_positions]  # Shape: (..., seq_len, d_k/2)
+        sin = self.sin_cached[token_positions]  # Shape: (..., seq_len, d_k/2)
+        
+        # Reshape x to separate consecutive pairs for efficient rotation
+        # Original shape: (..., seq_len, d_k)
+        # Reshaped: (..., seq_len, d_k/2, 2) where last dim has [even, odd] elements
+        x_reshaped = x.view(*x.shape[:-1], -1, 2)  # Shape: (..., seq_len, d_k/2, 2)
+        
+        # Extract even and odd indexed elements from each pair
+        # These correspond to x[..., 0::2] and x[..., 1::2] respectively
+        x_even = x_reshaped[..., 0]  # Shape: (..., seq_len, d_k/2) - dims 0, 2, 4, ...
+        x_odd = x_reshaped[..., 1]   # Shape: (..., seq_len, d_k/2) - dims 1, 3, 5, ...
+        
+        # Apply the 2D rotation to each pair of dimensions
+        # Rotation matrix: [[cos(θ), -sin(θ)], [sin(θ), cos(θ)]]
+        # Matrix multiplication gives:
+        # [rotated_even] = [cos(θ)  -sin(θ)] [x_even]
+        # [rotated_odd ]   [sin(θ)   cos(θ)] [x_odd ]
+        rotated_even = x_even * cos - x_odd * sin  # Shape: (..., seq_len, d_k/2)
+        rotated_odd = x_even * sin + x_odd * cos   # Shape: (..., seq_len, d_k/2)
+        
+        # Combine the rotated pairs back into the original format
+        # Stack the even and odd components back together
+        rotated_pairs = torch.stack([rotated_even, rotated_odd], dim=-1)  # Shape: (..., seq_len, d_k/2, 2)
+        
+        # Reshape back to the original tensor shape
+        # This interleaves the rotated even and odd elements correctly
+        rotated_x = rotated_pairs.view(x.shape)  # Shape: (..., seq_len, d_k)
+        
+        return rotated_x
+
+
 class Linear(nn.Module):
     """
     A Linear transformation module that applies a linear transformation to input data.
@@ -576,18 +691,44 @@ def run_rope(
     token_positions: Int[Tensor, " ... sequence_length"],
 ) -> Float[Tensor, " ... sequence_length d_k"]:
     """
-    Run RoPE for a given input tensor.
+    Test adapter function for the RotaryPositionalEmbedding module.
+    
+    This function creates a RoPE module with the specified parameters,
+    and applies rotary positional embedding to the input query or key tensor.
+    
+    The purpose is to test that our RoPE implementation can correctly
+    apply pairwise rotations based on token positions and produce the
+    expected positionally-encoded output.
 
     Args:
         d_k (int): Embedding dimension size for the query or key tensor.
-        theta (float): RoPE parameter.
-        max_seq_len (int): Maximum sequence length to pre-cache if your implementation does that.
-        in_query_or_key (Float[Tensor, "... sequence_length d_k"]): Input tensor to run RoPE on.
-        token_positions (Int[Tensor, "... sequence_length"]): Tensor of shape (batch_size, sequence_length) with the token positions
+            Must be even since RoPE works on pairs of dimensions.
+        theta (float): RoPE base frequency parameter Θ (typically 10000).
+        max_seq_len (int): Maximum sequence length for precomputing cos/sin values.
+        in_query_or_key (Float[Tensor, "... sequence_length d_k"]): Input tensor to apply RoPE to.
+            Can be query or key vectors with arbitrary leading batch dimensions.
+        token_positions (Int[Tensor, "... sequence_length"]): Token position indices.
+            Specifies the position of each token in the sequence for rotation calculation.
+            
     Returns:
-        Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
+        Float[Tensor, "... sequence_length d_k"]: Tensor with RoPE applied.
+            Same shape as input, with rotary positional encoding applied.
     """
-    raise NotImplementedError
+    # Create an instance of our RotaryPositionalEmbedding module
+    # We don't specify device, so it will use defaults (CPU)
+    rope = RotaryPositionalEmbedding(theta=theta, d_k=d_k, max_seq_len=max_seq_len)
+    
+    # Apply RoPE rotation to the input query or key tensor
+    # This calls our forward method which:
+    # 1. Extracts cos/sin values for given token positions
+    # 2. Reshapes input to separate dimension pairs
+    # 3. Applies 2D rotations to each pair: 
+    #    rotated_even = x_even * cos - x_odd * sin
+    #    rotated_odd = x_even * sin + x_odd * cos
+    # 4. Combines rotated pairs back to original shape
+    output = rope(in_query_or_key, token_positions)
+    
+    return output
 
 
 def run_transformer_block(
