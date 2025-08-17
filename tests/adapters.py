@@ -12,7 +12,7 @@ import numpy.typing as npt
 import torch
 from torch import Tensor
 import torch.nn as nn
-from einops import rearrange
+from einops import rearrange  # For self-documenting tensor transformations
 
 
 class Embedding(nn.Module):
@@ -348,10 +348,10 @@ class RotaryPositionalEmbedding(nn.Module):
         cos = self.cos_cached[token_positions]  # Shape: (..., seq_len, d_k/2)
         sin = self.sin_cached[token_positions]  # Shape: (..., seq_len, d_k/2)
         
-        # Reshape x to separate consecutive pairs for efficient rotation
-        # Original shape: (..., seq_len, d_k)
-        # Reshaped: (..., seq_len, d_k/2, 2) where last dim has [even, odd] elements
-        x_reshaped = x.view(*x.shape[:-1], -1, 2)  # Shape: (..., seq_len, d_k/2, 2)
+        # Reshape x to separate consecutive pairs for efficient rotation using einops
+        # Transform: (..., seq_len, d_k) -> (..., seq_len, d_k/2, 2) where last dim has [even, odd] elements
+        # This groups consecutive dimensions into pairs for 2D rotation
+        x_reshaped = rearrange(x, '... seq (pairs two) -> ... seq pairs two', two=2)
         
         # Extract even and odd indexed elements from each pair
         # These correspond to x[..., 0::2] and x[..., 1::2] respectively
@@ -366,13 +366,14 @@ class RotaryPositionalEmbedding(nn.Module):
         rotated_even = x_even * cos - x_odd * sin  # Shape: (..., seq_len, d_k/2)
         rotated_odd = x_even * sin + x_odd * cos   # Shape: (..., seq_len, d_k/2)
         
-        # Combine the rotated pairs back into the original format
+        # Combine the rotated pairs back into the original format using einops
         # Stack the even and odd components back together
         rotated_pairs = torch.stack([rotated_even, rotated_odd], dim=-1)  # Shape: (..., seq_len, d_k/2, 2)
         
-        # Reshape back to the original tensor shape
+        # Reshape back to the original tensor shape using einops
+        # Transform: (..., seq_len, d_k/2, 2) -> (..., seq_len, d_k)
         # This interleaves the rotated even and odd elements correctly
-        rotated_x = rotated_pairs.view(x.shape)  # Shape: (..., seq_len, d_k)
+        rotated_x = rearrange(rotated_pairs, '... seq pairs two -> ... seq (pairs two)')
         
         return rotated_x
 
@@ -414,9 +415,11 @@ def scaled_dot_product_attention(Q, K, V, mask=None):
     # Step 1: Compute attention scores Q @ K⊤
     # Q shape: (..., queries, d_k)
     # K shape: (..., keys, d_k)  
-    # K.transpose(-2, -1) shape: (..., d_k, keys)
+    # We need K⊤ with shape: (..., d_k, keys)
+    # Use einops for clearer transpose operation
+    K_transposed = rearrange(K, '... keys d_k -> ... d_k keys')
     # scores shape: (..., queries, keys)
-    scores = Q @ K.transpose(-2, -1)
+    scores = Q @ K_transposed
     
     # Step 2: Scale by √d_k for numerical stability
     # This prevents the softmax from saturating when d_k is large
@@ -523,21 +526,21 @@ class MultiHeadSelfAttention(nn.Module):
         # Q_flat = rearrange(Q, 'batch heads seq head_dim -> (batch heads) seq head_dim')
         # K_flat = rearrange(K, 'batch heads seq head_dim -> (batch heads) seq head_dim')
         # 
-        # # Expand token positions for all heads
-        # positions_flat = rearrange(token_positions, 'batch seq -> batch 1 seq')
-        # positions_flat = positions_flat.expand(-1, self.num_heads, -1)
-        # positions_flat = rearrange(positions_flat, 'batch heads seq -> (batch heads) seq')
+        # # Expand token positions for all heads using einops
+        # positions_expanded = rearrange(token_positions, 'batch seq -> batch 1 seq')
+        # positions_expanded = positions_expanded.expand(-1, self.num_heads, -1)
+        # positions_flat = rearrange(positions_expanded, 'batch heads seq -> (batch heads) seq')
         # 
-        # # Apply RoPE
+        # # Apply RoPE (same rotation for all heads)
         # Q_rotated = self.rope(Q_flat, positions_flat)  
         # K_rotated = self.rope(K_flat, positions_flat)
         # 
-        # # Reshape back to multi-head format
+        # # Reshape back to multi-head format using einops
         # Q = rearrange(Q_rotated, '(batch heads) seq head_dim -> batch heads seq head_dim', 
         #               batch=batch_size, heads=self.num_heads)
         # K = rearrange(K_rotated, '(batch heads) seq head_dim -> batch heads seq head_dim', 
         #               batch=batch_size, heads=self.num_heads)
-        # # Note: V is not rotated with RoPE
+        # # Note: V is not rotated with RoPE since values don't need positional information
         
         # TODO 7: Create causal mask to prevent attending to future tokens
         # Shape should be (seq_len, seq_len) 
@@ -558,7 +561,7 @@ class MultiHeadSelfAttention(nn.Module):
         # This "concatenates" the heads by flattening the head dimension
         # Use einops.rearrange for self-documenting transformation:
         # attn_output = rearrange(attn_output, 'batch heads seq head_dim -> batch seq (heads head_dim)')
-        # This is equivalent to: attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
+        # einops handles the reshaping automatically and clearly shows the transformation
         
         # TODO 10: Final linear projection using W_O
         # Apply output projection to get final result
