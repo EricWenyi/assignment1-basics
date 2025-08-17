@@ -495,7 +495,7 @@ class MultiHeadSelfAttention(nn.Module):
         # Apply to queries and keys (head_dim must be even for RoPE)
         # Example: self.rope = RotaryPositionalEmbedding(theta=theta, d_k=head_dim, max_seq_len=max_seq_len, device=device)
         if self.max_seq_len is not None:
-            self.rope = RotaryPositionalEmbedding(theta=theta, d_k=head_dim, max_seq_len=max_seq_len, device=device)
+            self.rope = RotaryPositionalEmbedding(theta=theta, d_k=self.head_dim, max_seq_len=max_seq_len, device=device)
         else:
             self.rope = None
         
@@ -572,6 +572,98 @@ class MultiHeadSelfAttention(nn.Module):
         # Shape: (batch_size, seq_len, d_model) -> (batch_size, seq_len, d_model)
         
         return output
+
+
+class TransformerBlock(nn.Module):
+    """
+    Pre-norm Transformer block as described in the assignment.
+    
+    Architecture (following Figure 2):
+    1. First sublayer: x + MultiHeadSelfAttention(RMSNorm(x))
+    2. Second sublayer: y + SwiGLU(RMSNorm(y))
+    
+    This is a "pre-norm" architecture where normalization happens BEFORE
+    the main operation (attention/feedforward), not after.
+    
+    Args:
+        d_model (int): Dimensionality of the Transformer block inputs/outputs
+        num_heads (int): Number of heads for multi-head self-attention
+        d_ff (int): Dimensionality of the feed-forward inner layer
+        max_seq_len (int): Maximum sequence length for RoPE (optional)
+        theta (float): RoPE parameter (default: 10000.0)
+        eps (float): RMSNorm epsilon for numerical stability (default: 1e-5)
+        device: Device to place parameters on
+        dtype: Data type for parameters
+    """
+    
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int = None, 
+                 theta: float = 10000.0, eps: float = 1e-5, device=None, dtype=None):
+        super().__init__()
+        
+        # Store parameters
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        
+        # Create the two RMSNorm layers (one for each sublayer)
+        # First RMSNorm layer applied before multi-head attention
+        self.ln1 = RMSNorm(d_model=d_model, eps=eps, device=device, dtype=dtype)
+        # Second RMSNorm layer applied before feed-forward network
+        self.ln2 = RMSNorm(d_model=d_model, eps=eps, device=device, dtype=dtype)
+        
+        # Create the multi-head self-attention layer
+        self.attn = MultiHeadSelfAttention(
+            d_model=d_model, 
+            num_heads=num_heads, 
+            max_seq_len=max_seq_len, 
+            theta=theta, 
+            device=device, 
+            dtype=dtype
+        )
+        
+        # Create the feed-forward network (SwiGLU)
+        self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff, device=device, dtype=dtype)
+        
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor = None) -> torch.Tensor:
+        """
+        Apply the pre-norm Transformer block.
+        
+        Architecture:
+        1. First sublayer: x + MultiHeadSelfAttention(RMSNorm(x))
+        2. Second sublayer: y + SwiGLU(RMSNorm(y))
+        
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, d_model)
+            token_positions: Token positions for RoPE of shape (batch_size, seq_len)
+            
+        Returns:
+            Output tensor of shape (batch_size, seq_len, d_model)
+        """
+        
+        # First sublayer: Multi-head self-attention with residual connection
+        # Step 1: Apply RMSNorm to input
+        normalized_input = self.ln1(x)
+        
+        # Step 2: Apply multi-head self-attention
+        # Pass token_positions for RoPE if provided
+        attn_output = self.attn(normalized_input, token_positions)
+        
+        # Step 3: Add residual connection
+        # This gives us: y = x + MultiHeadSelfAttention(RMSNorm(x))
+        y = x + attn_output
+        
+        # Second sublayer: Feed-forward network with residual connection  
+        # Step 4: Apply RMSNorm to the output of first sublayer
+        normalized_y = self.ln2(y)
+        
+        # Step 5: Apply feed-forward network (SwiGLU)
+        ffn_output = self.ffn(normalized_y)
+        
+        # Step 6: Add residual connection
+        # This gives us: final_output = y + SwiGLU(RMSNorm(y))
+        final_output = y + ffn_output
+        
+        return final_output
 
 
 class Linear(nn.Module):
@@ -1039,7 +1131,37 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    # Create a TransformerBlock instance with the specified parameters
+    transformer = TransformerBlock(
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        max_seq_len=max_seq_len,
+        theta=theta,
+    )
+    
+    # Load the provided weights into the transformer block components
+    # Load RMSNorm weights for both sublayers
+    transformer.ln1.weight.data = weights["ln1.weight"]
+    transformer.ln2.weight.data = weights["ln2.weight"]
+    
+    # Load multi-head attention weights
+    transformer.attn.W_Q.W.data = weights["attn.q_proj.weight"]
+    transformer.attn.W_K.W.data = weights["attn.k_proj.weight"]
+    transformer.attn.W_V.W.data = weights["attn.v_proj.weight"]
+    transformer.attn.W_O.W.data = weights["attn.output_proj.weight"]
+    
+    # Load SwiGLU feed-forward network weights
+    transformer.ffn.w1.W.data = weights["ffn.w1.weight"]
+    transformer.ffn.w2.W.data = weights["ffn.w2.weight"]
+    transformer.ffn.w3.W.data = weights["ffn.w3.weight"]
+    
+    # Generate token positions for RoPE (0, 1, 2, ..., seq_len-1)
+    batch_size, seq_len, _ = in_features.shape
+    token_positions = torch.arange(seq_len, device=in_features.device).unsqueeze(0).expand(batch_size, -1)
+    
+    # Apply the transformer block
+    return transformer.forward(in_features, token_positions)
 
 
 def run_transformer_lm(
