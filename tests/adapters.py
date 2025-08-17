@@ -12,7 +12,7 @@ import numpy.typing as npt
 import torch
 from torch import Tensor
 import torch.nn as nn
-from einops import rearrange  # For self-documenting tensor transformations
+from einops import rearrange, repeat  # For self-documenting tensor transformations
 
 
 class Embedding(nn.Module):
@@ -471,23 +471,33 @@ class MultiHeadSelfAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int, max_seq_len: int = None, theta: float = 10000.0, device=None, dtype=None):
         super().__init__()
         
-        # TODO 1: Store parameters and validate that d_model is divisible by num_heads
         # Store d_model, num_heads as instance variables
         # Calculate head_dim = d_model // num_heads (this is d_k = d_v from the paper)
         # Assert that d_model % num_heads == 0 to ensure even division
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.max_seq_len = max_seq_len
+        assert d_model % self.num_heads == 0, f"d_model must be divisible by num_heads"
+        self.head_dim = d_model // self.num_heads
         
-        # TODO 2: Create the linear projection layers using your Linear class
         # W_Q: Projects input to query vectors for ALL heads (shape: d_model -> d_model)
         # W_K: Projects input to key vectors for ALL heads (shape: d_model -> d_model) 
         # W_V: Projects input to value vectors for ALL heads (shape: d_model -> d_model)
         # W_O: Output projection after concatenating heads (shape: d_model -> d_model)
         # Example: self.W_Q = Linear(in_features=d_model, out_features=d_model, device=device, dtype=dtype)
+        self.W_Q = Linear(in_features=d_model, out_features=d_model, device=device, dtype=dtype)
+        self.W_K = Linear(in_features=d_model, out_features=d_model, device=device, dtype=dtype)
+        self.W_V = Linear(in_features=d_model, out_features=d_model, device=device, dtype=dtype)
+        self.W_O = Linear(in_features=d_model, out_features=d_model, device=device, dtype=dtype)
         
-        # TODO 3: Create RoPE module for positional encoding (if max_seq_len is provided)
         # Only create if max_seq_len is not None
         # Use your RotaryPositionalEmbedding class
         # Apply to queries and keys (head_dim must be even for RoPE)
         # Example: self.rope = RotaryPositionalEmbedding(theta=theta, d_k=head_dim, max_seq_len=max_seq_len, device=device)
+        if self.max_seq_len is not None:
+            self.rope = RotaryPositionalEmbedding(theta=theta, d_k=head_dim, max_seq_len=max_seq_len, device=device)
+        else:
+            self.rope = None
         
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor = None) -> torch.Tensor:
         """
@@ -502,77 +512,66 @@ class MultiHeadSelfAttention(nn.Module):
         """
         batch_size, seq_len, d_model = x.shape
         
-        # TODO 4: Linear projections - Project input to Q, K, V using the learned projection matrices
         # Apply W_Q, W_K, W_V to input x
-        # Q = self.W_Q(x)  # Shape: (batch_size, seq_len, d_model)
-        # K = self.W_K(x)  # Shape: (batch_size, seq_len, d_model)  
-        # V = self.W_V(x)  # Shape: (batch_size, seq_len, d_model)
+        Q = self.W_Q(x)  # Shape: (batch_size, seq_len, d_model)
+        K = self.W_K(x)  # Shape: (batch_size, seq_len, d_model)
+        V = self.W_V(x)  # Shape: (batch_size, seq_len, d_model)
         
-        # TODO 5: Reshape for multi-head attention using einops for clarity
         # Transform from (batch seq d_model) to (batch heads seq head_dim)
         # Use einops.rearrange for self-documenting transformations:
-        # Q = rearrange(Q, 'batch seq (heads head_dim) -> batch heads seq head_dim', 
-        #               heads=self.num_heads, head_dim=self.head_dim)
-        # K = rearrange(K, 'batch seq (heads head_dim) -> batch heads seq head_dim', 
-        #               heads=self.num_heads, head_dim=self.head_dim)
-        # V = rearrange(V, 'batch seq (heads head_dim) -> batch heads seq head_dim', 
-        #               heads=self.num_heads, head_dim=self.head_dim)
+        Q = rearrange(Q, 'batch seq (heads head_dim) -> batch heads seq head_dim',
+                      heads=self.num_heads, head_dim=self.head_dim)
+        K = rearrange(K, 'batch seq (heads head_dim) -> batch heads seq head_dim',
+                      heads=self.num_heads, head_dim=self.head_dim)
+        V = rearrange(V, 'batch seq (heads head_dim) -> batch heads seq head_dim',
+                      heads=self.num_heads, head_dim=self.head_dim)
         
-        # TODO 6: Apply RoPE to queries and keys (NOT values)
         # Only if self.rope exists and token_positions is provided
-        # RoPE treats heads as batch dimensions, so reshape for RoPE application:
-        # 
-        # Method: Flatten batch and head dimensions for RoPE, then reshape back
-        # Q_flat = rearrange(Q, 'batch heads seq head_dim -> (batch heads) seq head_dim')
-        # K_flat = rearrange(K, 'batch heads seq head_dim -> (batch heads) seq head_dim')
-        # 
-        # # Expand token positions for all heads using einops
-        # positions_expanded = rearrange(token_positions, 'batch seq -> batch 1 seq')
-        # positions_expanded = positions_expanded.expand(-1, self.num_heads, -1)
-        # positions_flat = rearrange(positions_expanded, 'batch heads seq -> (batch heads) seq')
-        # 
-        # # Apply RoPE (same rotation for all heads)
-        # Q_rotated = self.rope(Q_flat, positions_flat)  
-        # K_rotated = self.rope(K_flat, positions_flat)
-        # 
-        # # Reshape back to multi-head format using einops
-        # Q = rearrange(Q_rotated, '(batch heads) seq head_dim -> batch heads seq head_dim', 
-        #               batch=batch_size, heads=self.num_heads)
-        # K = rearrange(K_rotated, '(batch heads) seq head_dim -> batch heads seq head_dim', 
-        #               batch=batch_size, heads=self.num_heads)
-        # # Note: V is not rotated with RoPE since values don't need positional information
+        if self.rope is not None and token_positions is not None:
+            # RoPE treats heads as batch dimensions, so reshape for RoPE application:
+            #
+            # Method: Flatten batch and head dimensions for RoPE, then reshape back
+            Q_flat = rearrange(Q, 'batch heads seq head_dim -> (batch heads) seq head_dim')
+            K_flat = rearrange(K, 'batch heads seq head_dim -> (batch heads) seq head_dim')
+
+            # Expand token positions for all heads using einops
+            positions_expanded = repeat(token_positions, 'batch seq -> batch heads seq', heads=self.num_heads)
+            positions_flat = rearrange(positions_expanded, 'batch heads seq -> (batch heads) seq')
+
+            # Apply RoPE (same rotation for all heads)
+            Q_rotated = self.rope(Q_flat, positions_flat)
+            K_rotated = self.rope(K_flat, positions_flat)
+
+            # Reshape back to multi-head format using einops
+            Q = rearrange(Q_rotated, '(batch heads) seq head_dim -> batch heads seq head_dim',
+                          batch=batch_size, heads=self.num_heads)
+            K = rearrange(K_rotated, '(batch heads) seq head_dim -> batch heads seq head_dim',
+                          batch=batch_size, heads=self.num_heads)
+        # Note: V is not rotated with RoPE since values don't need positional information
         
-        # TODO 7: Create causal mask to prevent attending to future tokens
         # Shape should be (seq_len, seq_len) 
         # mask[i][j] = True if token i CAN attend to token j (i.e., j <= i)
         # mask[i][j] = False if token i CANNOT attend to token j (i.e., j > i)
-        # Method 1: causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device))
-        # Method 2: Use broadcasted comparison with torch.arange
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device))
+        # Method 2: Use broadcasted comparison with torch.arange (more efficient, but hard to read)
         
-        # TODO 8: Apply scaled dot-product attention for each head
         # Use your scaled_dot_product_attention function from earlier
         # Input shapes: Q, K, V are (batch_size, num_heads, seq_len, head_dim)
         # Mask shape: (seq_len, seq_len) - will broadcast to all batch and head dimensions
         # Output shape: (batch_size, num_heads, seq_len, head_dim)
-        # attn_output = scaled_dot_product_attention(Q, K, V, causal_mask)
+        attn_output = scaled_dot_product_attention(Q, K, V, causal_mask)
         
-        # TODO 9: Concatenate heads using einops for clarity
         # Transform from (batch heads seq head_dim) back to (batch seq d_model)
         # This "concatenates" the heads by flattening the head dimension
         # Use einops.rearrange for self-documenting transformation:
-        # attn_output = rearrange(attn_output, 'batch heads seq head_dim -> batch seq (heads head_dim)')
+        attn_output = rearrange(attn_output, 'batch heads seq head_dim -> batch seq (heads head_dim)')
         # einops handles the reshaping automatically and clearly shows the transformation
         
-        # TODO 10: Final linear projection using W_O
         # Apply output projection to get final result
-        # output = self.W_O(attn_output)
+        output = self.W_O(attn_output)
         # Shape: (batch_size, seq_len, d_model) -> (batch_size, seq_len, d_model)
         
-        # TODO 11: Return the final output
-        # return output
-        
-        # PLACEHOLDER: Remove this when you implement the above
-        return x  # This is just a placeholder - replace with your implementation
+        return output
 
 
 class Linear(nn.Module):
@@ -864,29 +863,22 @@ def run_multihead_self_attention(
             Same shape as input but last dimension is d_model
     """
     
-    # TODO 1: Create MultiHeadSelfAttention instance
     # Use the MultiHeadSelfAttention class you implemented above
     # Don't pass max_seq_len since this test doesn't use RoPE
-    # mha = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads)
+    mha = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads)
     
-    # TODO 2: Load the provided weights into the projection layers
     # The test provides pre-trained weights that need to be loaded into your model
     # Load weights using .data attribute to avoid affecting gradients
-    # mha.W_Q.W.data = q_proj_weight  # Query projection weights
-    # mha.W_K.W.data = k_proj_weight  # Key projection weights  
-    # mha.W_V.W.data = v_proj_weight  # Value projection weights
-    # mha.W_O.W.data = o_proj_weight  # Output projection weights
+    mha.W_Q.W.data = q_proj_weight  # Query projection weights
+    mha.W_K.W.data = k_proj_weight  # Key projection weights
+    mha.W_V.W.data = v_proj_weight  # Value projection weights
+    mha.W_O.W.data = o_proj_weight  # Output projection weights
     
-    # TODO 3: Apply multi-head self-attention to input features
     # Call the forward method of your MultiHeadSelfAttention module
     # Don't pass token_positions since this test doesn't use RoPE
-    # output = mha(in_features)
+    output = mha(in_features)
     
-    # TODO 4: Return the output
-    # return output
-    
-    # PLACEHOLDER: Remove this when you implement the above
-    raise NotImplementedError
+    return output
 
 
 def run_multihead_self_attention_with_rope(
