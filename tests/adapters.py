@@ -666,6 +666,129 @@ class TransformerBlock(nn.Module):
         return final_output
 
 
+class TransformerLM(nn.Module):
+    """
+    Complete Transformer Language Model as described in Section 3.1 and Figure 1.
+    
+    Architecture:
+    1. Token embeddings: Convert token IDs to dense vectors
+    2. Multiple Transformer blocks: Stack of self-attention and feed-forward layers
+    3. Final layer norm: Normalize the output of the last transformer block
+    4. Language model head: Project to vocabulary size
+    5. Softmax: Convert logits to probability distribution over vocabulary
+    
+    This implements a causal (autoregressive) language model that predicts the next token
+    given the previous tokens in the sequence.
+    
+    Args:
+        vocab_size (int): Size of the vocabulary (number of possible tokens)
+        context_length (int): Maximum sequence length the model can process
+        d_model (int): Dimensionality of the model embeddings and sublayer outputs
+        num_layers (int): Number of Transformer blocks to stack
+        num_heads (int): Number of attention heads in each Transformer block
+        d_ff (int): Dimensionality of the feed-forward inner layer
+        rope_theta (float): RoPE base frequency parameter (default: 10000.0)
+        eps (float): RMSNorm epsilon for numerical stability (default: 1e-5)
+        device: Device to place parameters on
+        dtype: Data type for parameters
+    """
+    
+    def __init__(self, vocab_size: int, context_length: int, d_model: int, num_layers: int, 
+                 num_heads: int, d_ff: int, rope_theta: float = 10000.0, eps: float = 1e-5, 
+                 device=None, dtype=None):
+        super().__init__()
+        
+        # Store parameters
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.rope_theta = rope_theta
+        
+        # Token embeddings: Convert token IDs to dense vectors
+        # Maps vocab_size token IDs to d_model dimensional embeddings
+        self.token_embeddings = Embedding(
+            num_embeddings=vocab_size, 
+            embedding_dim=d_model, 
+            device=device, 
+            dtype=dtype
+        )
+        
+        # Stack of Transformer blocks
+        # Each block applies self-attention and feed-forward transformation
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                d_model=d_model,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                max_seq_len=context_length,
+                theta=rope_theta,
+                eps=eps,
+                device=device,
+                dtype=dtype
+            ) for _ in range(num_layers)
+        ])
+        
+        # Final layer normalization applied to the output of the last transformer block
+        # This is common in modern transformer architectures for stability
+        self.ln_final = RMSNorm(d_model=d_model, eps=eps, device=device, dtype=dtype)
+        
+        # Language model head: Projects final hidden states to vocabulary logits
+        # This is typically a linear layer that outputs unnormalized probabilities
+        # over the vocabulary for next token prediction
+        self.lm_head = Linear(
+            in_features=d_model, 
+            out_features=vocab_size, 
+            device=device, 
+            dtype=dtype
+        )
+    
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the Transformer Language Model.
+        
+        Args:
+            input_ids (torch.Tensor): Input token IDs of shape (batch_size, sequence_length)
+                Each value should be an integer in range [0, vocab_size-1]
+                
+        Returns:
+            torch.Tensor: Logits over vocabulary of shape (batch_size, sequence_length, vocab_size)
+                Unnormalized scores for next token prediction at each position
+        """
+        batch_size, seq_len = input_ids.shape
+        
+        # Step 1: Convert token IDs to embeddings
+        # input_ids shape: (batch_size, seq_len)
+        # embeddings shape: (batch_size, seq_len, d_model)
+        x = self.token_embeddings(input_ids)
+        
+        # Step 2: Generate token positions for RoPE
+        # Positions are [0, 1, 2, ..., seq_len-1] for each sequence in the batch
+        token_positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        
+        # Step 3: Pass through all Transformer blocks
+        # Each block applies: x + MultiHeadSelfAttention(RMSNorm(x)) followed by x + SwiGLU(RMSNorm(x))
+        for layer in self.layers:
+            x = layer(x, token_positions)
+        
+        # Step 4: Apply final layer normalization
+        # This stabilizes training and is standard in modern transformer architectures
+        x = self.ln_final(x)
+        
+        # Step 5: Project to vocabulary size for next token prediction
+        # x shape: (batch_size, seq_len, d_model)
+        # logits shape: (batch_size, seq_len, vocab_size)
+        logits = self.lm_head(x)
+        
+        # Step 6: Return logits (unnormalized scores)
+        # In practice, we typically return logits and apply softmax separately
+        # This is for numerical stability during training with cross-entropy loss
+        # logits shape: (batch_size, seq_len, vocab_size)
+        return logits
+
+
 class Linear(nn.Module):
     """
     A Linear transformation module that applies a linear transformation to input data.
@@ -1243,7 +1366,49 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    # Create a TransformerLM instance with the specified parameters
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+    )
+    
+    # Load token embedding weights
+    model.token_embeddings.weight.data = weights["token_embeddings.weight"]
+    
+    # Load weights for each transformer layer
+    for layer_idx in range(num_layers):
+        layer = model.layers[layer_idx]
+        
+        # Load RMSNorm weights for this layer
+        layer.ln1.weight.data = weights[f"layers.{layer_idx}.ln1.weight"]
+        layer.ln2.weight.data = weights[f"layers.{layer_idx}.ln2.weight"]
+        
+        # Load multi-head attention weights for this layer
+        layer.attn.W_Q.W.data = weights[f"layers.{layer_idx}.attn.q_proj.weight"]
+        layer.attn.W_K.W.data = weights[f"layers.{layer_idx}.attn.k_proj.weight"]
+        layer.attn.W_V.W.data = weights[f"layers.{layer_idx}.attn.v_proj.weight"]
+        layer.attn.W_O.W.data = weights[f"layers.{layer_idx}.attn.output_proj.weight"]
+        
+        # Load SwiGLU feed-forward network weights for this layer
+        layer.ffn.w1.W.data = weights[f"layers.{layer_idx}.ffn.w1.weight"]
+        layer.ffn.w2.W.data = weights[f"layers.{layer_idx}.ffn.w2.weight"]
+        layer.ffn.w3.W.data = weights[f"layers.{layer_idx}.ffn.w3.weight"]
+    
+    # Load final layer norm weights
+    model.ln_final.weight.data = weights["ln_final.weight"]
+    
+    # Load language model head weights
+    model.lm_head.W.data = weights["lm_head.weight"]
+    
+    # Run forward pass
+    output = model(in_indices)
+    
+    return output
 
 
 def run_rmsnorm(
