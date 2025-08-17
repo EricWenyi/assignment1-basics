@@ -376,6 +376,74 @@ class RotaryPositionalEmbedding(nn.Module):
         return rotated_x
 
 
+def scaled_dot_product_attention(Q, K, V, mask=None):
+    """
+    Scaled Dot-Product Attention as described in Vaswani et al. [2017].
+    
+    Computes: Attention(Q, K, V) = softmax(Q⊤K / √d_k) V
+    
+    This is the core attention mechanism used in transformers. It allows each query
+    to attend to all keys, with attention weights determined by the similarity
+    between queries and keys (scaled by √d_k for numerical stability).
+    
+    Mathematical steps:
+    1. Compute attention scores: Q @ K⊤ 
+    2. Scale by √d_k: scores / √d_k
+    3. Apply mask (if provided): set False positions to -∞
+    4. Apply softmax: convert scores to attention weights  
+    5. Apply attention: weights @ V
+    
+    Args:
+        Q (torch.Tensor): Query tensor of shape (..., queries, d_k)
+            Can have arbitrary leading batch dimensions
+        K (torch.Tensor): Key tensor of shape (..., keys, d_k)
+            Same leading dimensions as Q, same d_k dimension
+        V (torch.Tensor): Value tensor of shape (..., keys, d_v)
+            Same leading dimensions and sequence length as K
+        mask (torch.Tensor | None): Boolean mask of shape (..., queries, keys)
+            True means attend (information flows), False means mask out
+            
+    Returns:
+        torch.Tensor: Attention output of shape (..., queries, d_v)
+            Weighted combination of values based on query-key similarities
+    """
+    # Get the key dimension for scaling
+    d_k = Q.shape[-1]
+    
+    # Step 1: Compute attention scores Q @ K⊤
+    # Q shape: (..., queries, d_k)
+    # K shape: (..., keys, d_k)  
+    # K.transpose(-2, -1) shape: (..., d_k, keys)
+    # scores shape: (..., queries, keys)
+    scores = Q @ K.transpose(-2, -1)
+    
+    # Step 2: Scale by √d_k for numerical stability
+    # This prevents the softmax from saturating when d_k is large
+    # The scaling ensures the variance of the dot products remains manageable
+    scores = scores / (d_k ** 0.5)
+    
+    # Step 3: Apply mask if provided
+    if mask is not None:
+        # For masked positions (False values), set scores to -∞
+        # This ensures that after softmax, these positions have probability 0
+        # We use a large negative value instead of true -∞ for numerical stability
+        scores = scores.masked_fill(~mask, float('-inf'))
+    
+    # Step 4: Apply softmax to get attention weights
+    # This converts the scaled scores into a probability distribution
+    # Each row (query) sums to 1.0 across all keys it can attend to
+    attention_weights = run_softmax(scores, dim=-1)  # Shape: (..., queries, keys)
+    
+    # Step 5: Apply attention weights to values
+    # This computes the weighted combination of values for each query
+    # attention_weights shape: (..., queries, keys)
+    # V shape: (..., keys, d_v)
+    # output shape: (..., queries, d_v)
+    output = attention_weights @ V
+    
+    return output
+
+
 class Linear(nn.Module):
     """
     A Linear transformation module that applies a linear transformation to input data.
@@ -595,18 +663,39 @@ def run_scaled_dot_product_attention(
     mask: Float[Tensor, " ... queries keys"] | None = None,
 ) -> Float[Tensor, " ... queries d_v"]:
     """
-    Given key (K), query (Q), and value (V) tensors, return
-    the output of your scaled dot product attention implementation.
+    Test adapter function for scaled dot-product attention.
+    
+    This function directly applies the scaled dot-product attention mechanism
+    to the provided query, key, and value tensors, with optional masking.
+    
+    The purpose is to test that our attention implementation correctly
+    computes the attention weights and produces the expected output.
 
     Args:
         Q (Float[Tensor, " ... queries d_k"]): Query tensor
-        K (Float[Tensor, " ... keys d_k"]): Key tensor
+            Shape: (..., num_queries, d_k) where ... represents batch dimensions
+        K (Float[Tensor, " ... keys d_k"]): Key tensor  
+            Shape: (..., num_keys, d_k) with same batch dimensions as Q
         V (Float[Tensor, " ... values d_v"]): Values tensor
-        mask (Float[Tensor, " ... queries keys"] | None): Mask tensor
+            Shape: (..., num_keys, d_v) with same batch and sequence dimensions as K
+        mask (Float[Tensor, " ... queries keys"] | None): Optional boolean mask
+            Shape: (..., num_queries, num_keys) 
+            True = attend to this position, False = mask out this position
+            
     Returns:
-        Float[Tensor, " ... queries d_v"]: Output of SDPA
+        Float[Tensor, " ... queries d_v"]: Attention output
+            Shape: (..., num_queries, d_v) - same batch dimensions as input
+            Weighted combination of values based on query-key attention
     """
-    raise NotImplementedError
+    # Apply scaled dot-product attention using our implementation
+    # This performs the full attention computation:
+    # 1. Compute Q @ K⊤ and scale by √d_k
+    # 2. Apply mask (set False positions to -∞)  
+    # 3. Apply softmax to get attention weights
+    # 4. Multiply weights by V to get final output
+    output = scaled_dot_product_attention(Q, K, V, mask)
+    
+    return output
 
 
 def run_multihead_self_attention(
