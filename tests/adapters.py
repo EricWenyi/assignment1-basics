@@ -12,6 +12,7 @@ import numpy.typing as npt
 import torch
 from torch import Tensor
 import torch.nn as nn
+from einops import rearrange
 
 
 class Embedding(nn.Module):
@@ -444,6 +445,133 @@ def scaled_dot_product_attention(Q, K, V, mask=None):
     return output
 
 
+class MultiHeadSelfAttention(nn.Module):
+    """
+    Causal Multi-Head Self-Attention as described in Vaswani et al. [2017].
+    
+    Mathematical formulation:
+    MultiHeadSelfAttention(x) = W_O * MultiHead(W_Q*x, W_K*x, W_V*x)
+    
+    Where MultiHead(Q, K, V) = Concat(head_1, ..., head_h)
+    And head_i = Attention(Q_i, K_i, V_i) for slice i of Q, K, V
+    
+    Key concepts you'll implement:
+    1. Linear projections: W_Q, W_K, W_V (shape: d_model -> num_heads * head_dim)
+    2. Head splitting: Reshape to separate heads 
+    3. RoPE application: Apply to Q and K (not V)
+    4. Causal masking: Prevent attending to future tokens
+    5. Scaled dot-product attention: For each head independently
+    6. Head concatenation: Combine all head outputs
+    7. Output projection: W_O to get final result
+    """
+    
+    def __init__(self, d_model: int, num_heads: int, max_seq_len: int = None, theta: float = 10000.0, device=None, dtype=None):
+        super().__init__()
+        
+        # TODO 1: Store parameters and validate that d_model is divisible by num_heads
+        # Store d_model, num_heads as instance variables
+        # Calculate head_dim = d_model // num_heads (this is d_k = d_v from the paper)
+        # Assert that d_model % num_heads == 0 to ensure even division
+        
+        # TODO 2: Create the linear projection layers using your Linear class
+        # W_Q: Projects input to query vectors for ALL heads (shape: d_model -> d_model)
+        # W_K: Projects input to key vectors for ALL heads (shape: d_model -> d_model) 
+        # W_V: Projects input to value vectors for ALL heads (shape: d_model -> d_model)
+        # W_O: Output projection after concatenating heads (shape: d_model -> d_model)
+        # Example: self.W_Q = Linear(in_features=d_model, out_features=d_model, device=device, dtype=dtype)
+        
+        # TODO 3: Create RoPE module for positional encoding (if max_seq_len is provided)
+        # Only create if max_seq_len is not None
+        # Use your RotaryPositionalEmbedding class
+        # Apply to queries and keys (head_dim must be even for RoPE)
+        # Example: self.rope = RotaryPositionalEmbedding(theta=theta, d_k=head_dim, max_seq_len=max_seq_len, device=device)
+        
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor = None) -> torch.Tensor:
+        """
+        Apply causal multi-head self-attention.
+        
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, d_model)
+            token_positions: Token positions for RoPE of shape (batch_size, seq_len)
+            
+        Returns:
+            Output tensor of shape (batch_size, seq_len, d_model)
+        """
+        batch_size, seq_len, d_model = x.shape
+        
+        # TODO 4: Linear projections - Project input to Q, K, V using the learned projection matrices
+        # Apply W_Q, W_K, W_V to input x
+        # Q = self.W_Q(x)  # Shape: (batch_size, seq_len, d_model)
+        # K = self.W_K(x)  # Shape: (batch_size, seq_len, d_model)  
+        # V = self.W_V(x)  # Shape: (batch_size, seq_len, d_model)
+        
+        # TODO 5: Reshape for multi-head attention using einops for clarity
+        # Transform from (batch seq d_model) to (batch heads seq head_dim)
+        # Use einops.rearrange for self-documenting transformations:
+        # Q = rearrange(Q, 'batch seq (heads head_dim) -> batch heads seq head_dim', 
+        #               heads=self.num_heads, head_dim=self.head_dim)
+        # K = rearrange(K, 'batch seq (heads head_dim) -> batch heads seq head_dim', 
+        #               heads=self.num_heads, head_dim=self.head_dim)
+        # V = rearrange(V, 'batch seq (heads head_dim) -> batch heads seq head_dim', 
+        #               heads=self.num_heads, head_dim=self.head_dim)
+        
+        # TODO 6: Apply RoPE to queries and keys (NOT values)
+        # Only if self.rope exists and token_positions is provided
+        # RoPE treats heads as batch dimensions, so reshape for RoPE application:
+        # 
+        # Method: Flatten batch and head dimensions for RoPE, then reshape back
+        # Q_flat = rearrange(Q, 'batch heads seq head_dim -> (batch heads) seq head_dim')
+        # K_flat = rearrange(K, 'batch heads seq head_dim -> (batch heads) seq head_dim')
+        # 
+        # # Expand token positions for all heads
+        # positions_flat = rearrange(token_positions, 'batch seq -> batch 1 seq')
+        # positions_flat = positions_flat.expand(-1, self.num_heads, -1)
+        # positions_flat = rearrange(positions_flat, 'batch heads seq -> (batch heads) seq')
+        # 
+        # # Apply RoPE
+        # Q_rotated = self.rope(Q_flat, positions_flat)  
+        # K_rotated = self.rope(K_flat, positions_flat)
+        # 
+        # # Reshape back to multi-head format
+        # Q = rearrange(Q_rotated, '(batch heads) seq head_dim -> batch heads seq head_dim', 
+        #               batch=batch_size, heads=self.num_heads)
+        # K = rearrange(K_rotated, '(batch heads) seq head_dim -> batch heads seq head_dim', 
+        #               batch=batch_size, heads=self.num_heads)
+        # # Note: V is not rotated with RoPE
+        
+        # TODO 7: Create causal mask to prevent attending to future tokens
+        # Shape should be (seq_len, seq_len) 
+        # mask[i][j] = True if token i CAN attend to token j (i.e., j <= i)
+        # mask[i][j] = False if token i CANNOT attend to token j (i.e., j > i)
+        # Method 1: causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device))
+        # Method 2: Use broadcasted comparison with torch.arange
+        
+        # TODO 8: Apply scaled dot-product attention for each head
+        # Use your scaled_dot_product_attention function from earlier
+        # Input shapes: Q, K, V are (batch_size, num_heads, seq_len, head_dim)
+        # Mask shape: (seq_len, seq_len) - will broadcast to all batch and head dimensions
+        # Output shape: (batch_size, num_heads, seq_len, head_dim)
+        # attn_output = scaled_dot_product_attention(Q, K, V, causal_mask)
+        
+        # TODO 9: Concatenate heads using einops for clarity
+        # Transform from (batch heads seq head_dim) back to (batch seq d_model)
+        # This "concatenates" the heads by flattening the head dimension
+        # Use einops.rearrange for self-documenting transformation:
+        # attn_output = rearrange(attn_output, 'batch heads seq head_dim -> batch seq (heads head_dim)')
+        # This is equivalent to: attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
+        
+        # TODO 10: Final linear projection using W_O
+        # Apply output projection to get final result
+        # output = self.W_O(attn_output)
+        # Shape: (batch_size, seq_len, d_model) -> (batch_size, seq_len, d_model)
+        
+        # TODO 11: Return the final output
+        # return output
+        
+        # PLACEHOLDER: Remove this when you implement the above
+        return x  # This is just a placeholder - replace with your implementation
+
+
 class Linear(nn.Module):
     """
     A Linear transformation module that applies a linear transformation to input data.
@@ -708,27 +836,53 @@ def run_multihead_self_attention(
     in_features: Float[Tensor, " ... sequence_length d_in"],
 ) -> Float[Tensor, " ... sequence_length d_out"]:
     """
-    Given the key, query, and value projection weights of a naive unbatched
-    implementation of multi-head attention, return the output of an optimized batched
-    implementation. This implementation should handle the key, query, and value projections
-    for all heads in a single matrix multiply.
-    This function should not use RoPE.
-    See section 3.2.2 of Vaswani et al., 2017.
+    Test adapter function for multi-head self-attention.
+    
+    This function creates a MultiHeadSelfAttention module, loads the provided
+    weights into the projection layers, and applies multi-head attention to
+    the input features with causal masking.
 
     Args:
         d_model (int): Dimensionality of the feedforward input and output.
         num_heads (int): Number of heads to use in multi-headed attention.
-        max_seq_len (int): Maximum sequence length to pre-cache if your implementation does that.
-        q_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the Q projection
-        k_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the K projection
-        v_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the V projection
-        o_proj_weight (Float[Tensor, "d_model d_v"]): Weights for the output projection
-        in_features (Float[Tensor, "... sequence_length d_in"]): Tensor to run your implementation on.
+        q_proj_weight (Float[Tensor, "d_model d_in"]): Weights for the Q projection
+            Shape: (d_model, d_in) - projects input to query vectors for all heads
+        k_proj_weight (Float[Tensor, "d_model d_in"]): Weights for the K projection  
+            Shape: (d_model, d_in) - projects input to key vectors for all heads
+        v_proj_weight (Float[Tensor, "d_model d_in"]): Weights for the V projection
+            Shape: (d_model, d_in) - projects input to value vectors for all heads
+        o_proj_weight (Float[Tensor, "d_model d_model"]): Weights for the output projection
+            Shape: (d_model, d_model) - projects concatenated heads back to d_model
+        in_features (Float[Tensor, "... sequence_length d_in"]): Input tensor
+            Can have arbitrary batch dimensions, last two dims are (seq_len, d_in)
 
     Returns:
-        Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
-        implementation with the given QKV projection weights and input features.
+        Float[Tensor, " ... sequence_length d_out"]: Output of multi-head attention
+            Same shape as input but last dimension is d_model
     """
+    
+    # TODO 1: Create MultiHeadSelfAttention instance
+    # Use the MultiHeadSelfAttention class you implemented above
+    # Don't pass max_seq_len since this test doesn't use RoPE
+    # mha = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads)
+    
+    # TODO 2: Load the provided weights into the projection layers
+    # The test provides pre-trained weights that need to be loaded into your model
+    # Load weights using .data attribute to avoid affecting gradients
+    # mha.W_Q.W.data = q_proj_weight  # Query projection weights
+    # mha.W_K.W.data = k_proj_weight  # Key projection weights  
+    # mha.W_V.W.data = v_proj_weight  # Value projection weights
+    # mha.W_O.W.data = o_proj_weight  # Output projection weights
+    
+    # TODO 3: Apply multi-head self-attention to input features
+    # Call the forward method of your MultiHeadSelfAttention module
+    # Don't pass token_positions since this test doesn't use RoPE
+    # output = mha(in_features)
+    
+    # TODO 4: Return the output
+    # return output
+    
+    # PLACEHOLDER: Remove this when you implement the above
     raise NotImplementedError
 
 
