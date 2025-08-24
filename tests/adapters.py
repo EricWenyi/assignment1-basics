@@ -1721,4 +1721,15 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    # Import our BPE implementation
+    import sys
+    from pathlib import Path
+    
+    # Add the project root to the path to import our bpe_tokenizer
+    project_root = Path(__file__).parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    
+    from bpe_tokenizer import train_bpe
+    
+    return train_bpe(str(input_path), vocab_size, special_tokens)
