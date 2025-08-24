@@ -1691,7 +1691,18 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    # Import our BPE tokenizer implementation
+    import sys
+    from pathlib import Path
+    
+    # Add the project root to the path to import our bpe_tokenizer
+    project_root = Path(__file__).parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    
+    from bpe_tokenizer import Tokenizer
+    
+    return Tokenizer(vocab, merges, special_tokens)
 
 
 def run_train_bpe(
