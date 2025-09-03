@@ -1581,7 +1581,11 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    # Use PyTorch's built-in cross entropy loss function
+    # F.cross_entropy applies softmax and computes negative log likelihood automatically
+    # and averages across the batch by default
+    return F.cross_entropy(inputs, targets)
+
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
