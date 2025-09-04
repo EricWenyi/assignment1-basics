@@ -1597,7 +1597,48 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    # Convert to list to allow multiple iterations if needed
+    parameters = list(parameters)
+    
+    # Step 1: Collect all gradients that exist (skip parameters without gradients)
+    gradients = []
+    for param in parameters:
+        if param.grad is not None:
+            gradients.append(param.grad)
+    
+    # If no gradients exist, nothing to clip
+    if not gradients:
+        return
+    
+    # Step 2: Compute the total L2 norm of all gradients combined
+    # This is ||g||₂ where g is the concatenation of all parameter gradients
+    total_norm = 0.0
+    for grad in gradients:
+        # Add the squared norm of this gradient tensor to total
+        # grad.norm() computes the L2 norm of the tensor
+        param_norm = grad.norm(dtype=torch.float32)
+        total_norm += param_norm.item() ** 2
+    
+    # Take square root to get the L2 norm
+    total_norm = total_norm ** 0.5
+    
+    # Step 3: Check if clipping is needed
+    # Add epsilon for numerical stability (PyTorch default: 1e-6)
+    eps = 1e-6
+    
+    if total_norm > max_l2_norm:
+        # Step 4: Compute clipping factor
+        # We want to scale all gradients by: max_l2_norm / (total_norm + eps)
+        # This ensures the resulting norm will be just under max_l2_norm
+        clip_factor = max_l2_norm / (total_norm + eps)
+        
+        # Step 5: Apply clipping to all gradients in-place
+        for grad in gradients:
+            # Scale each gradient by the clip factor
+            # This modifies the gradient tensors in-place
+            grad.mul_(clip_factor)
+    
+    # If total_norm <= max_l2_norm, we don't modify the gradients (no clipping needed)
 
 
 def get_adamw_cls() -> Any:
@@ -1643,7 +1684,45 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    import math
+    
+    # The cosine annealing schedule has three phases:
+    # 1. Warmup phase: Linear increase from 0 to max_learning_rate
+    # 2. Cosine annealing phase: Cosine decay from max_learning_rate to min_learning_rate  
+    # 3. Post-annealing phase: Constant at min_learning_rate
+    
+    # Phase 1: Warmup (t < T_w)
+    # Linear warmup: α_t = (t / T_w) * α_max
+    if it < warmup_iters:
+        # Linearly interpolate from 0 to max_learning_rate over warmup_iters steps
+        # At t=0: learning_rate = 0
+        # At t=T_w-1: learning_rate approaches α_max
+        # At t=T_w: learning_rate = α_max (handled by next condition)
+        return (it / warmup_iters) * max_learning_rate
+    
+    # Phase 2: Cosine Annealing (T_w ≤ t ≤ T_c)  
+    # α_t = α_min + 0.5 * (1 + cos((t - T_w) / (T_c - T_w) * π)) * (α_max - α_min)
+    elif it <= cosine_cycle_iters:
+        # Calculate progress through the cosine cycle (0 to 1)
+        # When t = T_w: progress = 0, cos(0) = 1, so α_t = α_max
+        # When t = T_c: progress = 1, cos(π) = -1, so α_t = α_min
+        progress = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
+        
+        # Cosine annealing formula
+        # cos(progress * π) goes from cos(0)=1 to cos(π)=-1
+        # (1 + cos(...)) goes from 2 to 0
+        # 0.5 * (1 + cos(...)) goes from 1 to 0
+        # This creates smooth decay from α_max to α_min
+        cosine_factor = 0.5 * (1 + math.cos(progress * math.pi))
+        learning_rate = min_learning_rate + cosine_factor * (max_learning_rate - min_learning_rate)
+        
+        return learning_rate
+    
+    # Phase 3: Post-annealing (t > T_c)
+    # Constant learning rate: α_t = α_min
+    else:
+        # After cosine cycle completes, maintain minimum learning rate
+        return min_learning_rate
 
 
 def run_save_checkpoint(
