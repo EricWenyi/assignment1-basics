@@ -1510,7 +1510,32 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    import numpy as np
+    import torch
+    
+    # Calculate the maximum valid starting position
+    # We need context_length tokens for input and 1 more for the target
+    max_start_idx = len(dataset) - context_length
+    
+    # Sample random starting positions for each sequence in the batch
+    start_indices = np.random.randint(0, max_start_idx, size=batch_size)
+    
+    # Initialize arrays to store input sequences and targets
+    inputs = np.zeros((batch_size, context_length), dtype=np.int64)
+    targets = np.zeros((batch_size, context_length), dtype=np.int64)
+    
+    # Extract sequences for each batch element
+    for i, start_idx in enumerate(start_indices):
+        # Input sequence: x[start_idx:start_idx+context_length]
+        inputs[i] = dataset[start_idx:start_idx + context_length]
+        # Target sequence: x[start_idx+1:start_idx+context_length+1] (next tokens)
+        targets[i] = dataset[start_idx + 1:start_idx + context_length + 1]
+    
+    # Convert to PyTorch tensors and place on specified device
+    input_tensor = torch.from_numpy(inputs).to(device)
+    target_tensor = torch.from_numpy(targets).to(device)
+    
+    return input_tensor, target_tensor
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -1741,7 +1766,17 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    import torch
+    
+    # Create checkpoint dictionary containing all necessary state
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'iteration': iteration
+    }
+    
+    # Save checkpoint to the specified output destination
+    torch.save(checkpoint, out)
 
 
 def run_load_checkpoint(
@@ -1762,7 +1797,19 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    import torch
+    
+    # Load checkpoint from the specified source
+    checkpoint = torch.load(src)
+    
+    # Restore model state
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Restore optimizer state
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    # Return the iteration number
+    return checkpoint['iteration']
 
 
 def get_tokenizer(
