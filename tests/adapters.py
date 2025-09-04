@@ -1604,7 +1604,18 @@ def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    # Import our AdamW implementation
+    import sys
+    from pathlib import Path
+    
+    # Add the project root to the path to import our adamw_optimizer
+    project_root = Path(__file__).parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    
+    from adamw_optimizer import AdamW
+    
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
