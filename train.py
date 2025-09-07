@@ -26,6 +26,7 @@ import torch.nn.functional as F
 
 # Import our custom implementations
 from adamw_optimizer import AdamW
+from experiment_tracker import ExperimentTracker
 from tests.adapters import (
     TransformerLM,
     run_get_batch,
@@ -107,7 +108,17 @@ def parse_args():
     parser.add_argument("--dtype", type=str, default="bfloat16",
                         help="Data type for training ('float32', 'float16', 'bfloat16')")
     
-    # Weights & Biases logging
+    # Experiment tracking
+    parser.add_argument("--experiment_name", type=str, default=None,
+                        help="Name for this experiment (auto-generated if not provided)")
+    parser.add_argument("--experiment_description", type=str, default="",
+                        help="Description of the experiment")
+    parser.add_argument("--experiment_tags", type=str, nargs="*", default=[],
+                        help="Tags for categorizing the experiment")
+    parser.add_argument("--experiments_dir", type=str, default="experiments",
+                        help="Directory to store experiment logs and results")
+    
+    # Weights & Biases logging (optional)
     parser.add_argument("--wandb", action="store_true",
                         help="Enable Weights & Biases logging")
     parser.add_argument("--wandb_project", type=str, default="transformer-lm",
@@ -201,8 +212,21 @@ def main():
     print(f"Using device: {device}")
     print(f"Using dtype: {dtype}")
     
-    # Create checkpoint directory
-    checkpoint_dir = Path(args.checkpoint_dir)
+    # Generate experiment name if not provided
+    if args.experiment_name is None:
+        args.experiment_name = f"transformer_{args.d_model}d_{args.num_layers}l_{args.batch_size}b"
+    
+    # Initialize experiment tracker
+    experiment = ExperimentTracker(
+        experiment_name=args.experiment_name,
+        base_dir=args.experiments_dir,
+        description=args.experiment_description,
+        tags=args.experiment_tags,
+        auto_save_interval=args.log_interval
+    )
+    
+    # Create checkpoint directory (use experiment directory)
+    checkpoint_dir = experiment.exp_dir / "checkpoints"
     checkpoint_dir.mkdir(exist_ok=True)
     
     # Initialize Weights & Biases if requested
@@ -243,6 +267,35 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
+    
+    # Log hyperparameters and model config to experiment tracker
+    experiment.log_hyperparameters({
+        'learning_rate': args.learning_rate,
+        'min_learning_rate': args.min_learning_rate,
+        'warmup_iters': args.warmup_iters,
+        'cosine_cycle_iters': args.cosine_cycle_iters,
+        'batch_size': args.batch_size,
+        'weight_decay': args.weight_decay,
+        'beta1': args.beta1,
+        'beta2': args.beta2,
+        'eps': args.eps,
+        'grad_clip': args.grad_clip,
+        'max_iterations': args.max_iterations,
+        'device': device,
+        'dtype': str(dtype)
+    })
+    
+    experiment.log_model_config({
+        'vocab_size': args.vocab_size,
+        'context_length': args.context_length,
+        'd_model': args.d_model,
+        'num_layers': args.num_layers,
+        'num_heads': args.num_heads,
+        'd_ff': args.d_ff,
+        'rope_theta': args.rope_theta,
+        'total_parameters': total_params,
+        'trainable_parameters': trainable_params
+    })
     
     # Initialize optimizer
     optimizer = AdamW(
@@ -332,19 +385,28 @@ def main():
             elapsed_time = time.time() - start_time
             tokens_per_sec = (iteration + 1 - start_iter) * args.batch_size * args.context_length / elapsed_time
             
-            print(f"Iter {iteration + 1:6d}/{args.max_iterations} | "
-                  f"Loss: {avg_loss:.4f} | PPL: {perplexity:.2f} | "
-                  f"LR: {lr:.2e} | {tokens_per_sec:.0f} tok/s | "
-                  f"{iter_time*1000:.1f}ms/iter")
+            # Log to experiment tracker
+            experiment.log_metrics(
+                step=iteration + 1,
+                metrics={
+                    'loss': avg_loss,
+                    'perplexity': perplexity,
+                    'learning_rate': lr,
+                    'tokens_per_second': tokens_per_sec,
+                    'iter_time_ms': iter_time * 1000
+                },
+                split='train'
+            )
             
-            # if args.wandb and wandb_run:
-            #     wandb_run.log({
-            #         "train/loss": avg_loss,
-            #         "train/perplexity": perplexity,
-            #         "train/learning_rate": lr,
-            #         "train/tokens_per_second": tokens_per_sec,
-            #         "iteration": iteration + 1
-            #     })
+            # Optional Weights & Biases logging
+            if args.wandb and wandb_run:
+                wandb_run.log({
+                    "train/loss": avg_loss,
+                    "train/perplexity": perplexity,
+                    "train/learning_rate": lr,
+                    "train/tokens_per_second": tokens_per_sec,
+                    "iteration": iteration + 1
+                })
             
             running_loss = 0.0
         
@@ -356,14 +418,23 @@ def main():
             )
             val_loss = math.log(val_perplexity)
             
-            print(f"Validation | Loss: {val_loss:.4f} | PPL: {val_perplexity:.2f}")
+            # Log validation metrics to experiment tracker
+            experiment.log_metrics(
+                step=iteration + 1,
+                metrics={
+                    'loss': val_loss,
+                    'perplexity': val_perplexity
+                },
+                split='val'
+            )
             
-            # if args.wandb and wandb_run:
-            #     wandb_run.log({
-            #         "val/loss": val_loss,
-            #         "val/perplexity": val_perplexity,
-            #         "iteration": iteration + 1
-            #     })
+            # Optional Weights & Biases logging
+            if args.wandb and wandb_run:
+                wandb_run.log({
+                    "val/loss": val_loss,
+                    "val/perplexity": val_perplexity,
+                    "iteration": iteration + 1
+                })
             
             # Save best model
             if val_loss < best_val_loss:
@@ -371,6 +442,9 @@ def main():
                 best_checkpoint_path = checkpoint_dir / "best_model.pt"
                 run_save_checkpoint(model, optimizer, iteration + 1, best_checkpoint_path)
                 print(f"Saved new best model to {best_checkpoint_path}")
+                
+                # Generate loss curves when we find a new best model
+                experiment.plot_loss_curves(save_plot=True, show_plot=False)
         
         # Save checkpoint
         if (iteration + 1) % args.save_interval == 0:
@@ -403,14 +477,32 @@ def main():
     print(f"Training completed in {total_time:.1f} seconds")
     print(f"Processed {total_tokens:,} tokens ({total_tokens / total_time:.0f} tokens/sec)")
     
-    # if args.wandb and wandb_run:
-    #     wandb_run.log({
-    #         "final/val_loss": final_val_loss,
-    #         "final/val_perplexity": final_val_perplexity,
-    #         "final/total_time": total_time,
-    #         "final/total_tokens": total_tokens
-    #     })
-    #     wandb_run.finish()
+    # Log final metrics to experiment tracker
+    experiment.log_metrics(
+        step=args.max_iterations,
+        metrics={
+            'final_val_loss': final_val_loss,
+            'final_val_perplexity': final_val_perplexity,
+            'total_time_seconds': total_time,
+            'total_tokens': total_tokens,
+            'final_tokens_per_second': total_tokens / total_time
+        },
+        split='final',
+        force_save=True
+    )
+    
+    # Finalize experiment (saves all data and generates final plots)
+    experiment.finalize(create_plots=True)
+    
+    # Optional Weights & Biases logging
+    if args.wandb and wandb_run:
+        wandb_run.log({
+            "final/val_loss": final_val_loss,
+            "final/val_perplexity": final_val_perplexity,
+            "final/total_time": total_time,
+            "final/total_tokens": total_tokens
+        })
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
