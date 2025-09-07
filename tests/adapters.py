@@ -10,6 +10,7 @@ from jaxtyping import Float, Int
 
 import numpy.typing as npt
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 import torch.nn as nn
 from einops import rearrange, repeat  # For self-documenting tensor transformations
@@ -1641,7 +1642,7 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
     for grad in gradients:
         # Add the squared norm of this gradient tensor to total
         # grad.norm() computes the L2 norm of the tensor
-        param_norm = grad.norm(dtype=torch.float32)
+        param_norm = grad.norm()
         total_norm += param_norm.item() ** 2
     
     # Take square root to get the L2 norm
