@@ -13,7 +13,7 @@ import os
 from bpe_tokenizer import train_bpe
 
 
-def train_bpe_tinystories(data_path="../data/TinyStoriesV2-GPT4-train.txt", vocab_size=10000):
+def train_bpe_tinystories(data_path="../data/TinyStoriesV2-GPT4-train.txt", vocab_size=32000):
     """
     Train a BPE tokenizer on the TinyStories dataset.
     
@@ -108,13 +108,13 @@ def train_bpe_tinystories(data_path="../data/TinyStoriesV2-GPT4-train.txt", voca
 
 if __name__ == "__main__":
     # Check if data file exists
-    data_file = "../data/TinyStoriesV2-GPT4-train.txt"
+    data_file = "../data/owt_valid.txt"
     if not os.path.exists(data_file):
         print(f"Error: Data file {data_file} not found!")
         exit(1)
     
     # Train the tokenizer
-    vocab, merges, training_time, longest_token = train_bpe_tinystories()
+    vocab, merges, training_time, longest_token = train_bpe_tinystories(data_file)
     
     # Print summary
     print("\n=== Training Summary ===")
