@@ -628,6 +628,75 @@ class Tokenizer:
         
         return cls(vocab, merges, special_tokens)
     
+    @classmethod
+    def from_pickle(cls, vocab_pickle_path: str, merges_pickle_path: str, special_tokens: List[str] = None):
+        """
+        Create a tokenizer from pickled vocabulary and merges files.
+        
+        This method loads the vocabulary and merges from pickle files in their
+        native Python formats: dict[int, bytes] and list[tuple[bytes, bytes]].
+        
+        Args:
+            vocab_pickle_path: Path to pickle file containing vocabulary (dict[int, bytes])
+            merges_pickle_path: Path to pickle file containing merges (list[tuple[bytes, bytes]])
+            special_tokens: Optional list of special token strings
+            
+        Returns:
+            Tokenizer instance
+        """
+        import pickle
+        
+        # Load vocabulary from pickle file
+        with open(vocab_pickle_path, 'rb') as f:
+            vocab = pickle.load(f)
+        
+        # Load merges from pickle file  
+        with open(merges_pickle_path, 'rb') as f:
+            merges = pickle.load(f)
+        
+        # Validate loaded data types
+        if not isinstance(vocab, dict):
+            raise ValueError(f"Expected vocab to be dict, got {type(vocab)}")
+        if not isinstance(merges, list):
+            raise ValueError(f"Expected merges to be list, got {type(merges)}")
+        
+        # Validate vocab format: dict[int, bytes]
+        for token_id, token_bytes in vocab.items():
+            if not isinstance(token_id, int):
+                raise ValueError(f"Expected vocab keys to be int, got {type(token_id)}")
+            if not isinstance(token_bytes, bytes):
+                raise ValueError(f"Expected vocab values to be bytes, got {type(token_bytes)}")
+        
+        # Validate merges format: list[tuple[bytes, bytes]]
+        for i, merge in enumerate(merges):
+            if not isinstance(merge, tuple) or len(merge) != 2:
+                raise ValueError(f"Expected merge {i} to be tuple of length 2, got {type(merge)} of length {len(merge) if hasattr(merge, '__len__') else 'unknown'}")
+            merge1, merge2 = merge
+            if not isinstance(merge1, bytes) or not isinstance(merge2, bytes):
+                raise ValueError(f"Expected merge {i} elements to be bytes, got {type(merge1)}, {type(merge2)}")
+        
+        return cls(vocab, merges, special_tokens)
+    
+    def save_pickle(self, vocab_pickle_path: str, merges_pickle_path: str):
+        """
+        Save the tokenizer's vocabulary and merges to pickle files.
+        
+        Args:
+            vocab_pickle_path: Path to save vocabulary pickle file  
+            merges_pickle_path: Path to save merges pickle file
+        """
+        import pickle
+        
+        # Save vocabulary (dict[int, bytes])
+        with open(vocab_pickle_path, 'wb') as f:
+            pickle.dump(self.vocab, f)
+        
+        # Save merges (list[tuple[bytes, bytes]])
+        with open(merges_pickle_path, 'wb') as f:
+            pickle.dump(self.merges, f)
+        
+        print(f"Tokenizer saved: {vocab_pickle_path}, {merges_pickle_path}")
+    
     def _apply_bpe_to_token(self, token_bytes: bytes) -> List[int]:
         """
         Apply BPE merges to a single pre-token (sequence of bytes).

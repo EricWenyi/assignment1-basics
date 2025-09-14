@@ -574,6 +574,18 @@ def train_bpe_tinystories(data_path="../data/TinyStoriesV2-GPT4-train.txt", voca
     print(f"Vocabulary saved to {vocab_file}")
     print(f"Merges saved to {merges_file}")
     
+    # Also save in native Python format (pickle) for exact type preservation
+    vocab_pickle_file = "tinystories_vocab.pkl"
+    merges_pickle_file = "tinystories_merges.pkl"
+    
+    with open(vocab_pickle_file, 'wb') as f:
+        pickle.dump(vocab, f)
+    
+    with open(merges_pickle_file, 'wb') as f:
+        pickle.dump(merges, f)
+    
+    print(f"Native formats saved: {vocab_pickle_file}, {merges_pickle_file}")
+    
     return vocab, merges, training_time_hours, longest_token
 
 
