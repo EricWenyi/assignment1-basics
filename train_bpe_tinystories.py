@@ -20,6 +20,93 @@ from multiprocessing import Pool, cpu_count
 import regex as re
 
 
+def stream_process_file(file_path, special_tokens, chunk_size_mb=100):
+    """
+    Memory-efficient streaming file processing that doesn't load entire file into memory.
+    
+    Args:
+        file_path: Path to input file
+        special_tokens: List of special tokens
+        chunk_size_mb: Size of chunks to process at a time (MB)
+    
+    Returns:
+        Counter of word frequencies
+    """
+    print(f"   Using streaming processing (chunks of {chunk_size_mb}MB)")
+    
+    word_counts = Counter()
+    chunk_size_bytes = chunk_size_mb * 1024 * 1024
+    
+    # Prepare special token regex pattern
+    if special_tokens:
+        delimiter_pattern = "|".join(re.escape(token) for token in special_tokens)
+    else:
+        delimiter_pattern = None
+    
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        buffer = ""
+        chunk_num = 0
+        
+        while True:
+            # Read chunk
+            chunk = f.read(chunk_size_bytes)
+            if not chunk:
+                # Process final buffer
+                if buffer:
+                    process_text_chunk(buffer, word_counts, delimiter_pattern)
+                break
+            
+            chunk_num += 1
+            if chunk_num % 10 == 0:
+                memory_mb = psutil.Process().memory_info().rss / 1024**2
+                print(f"   Processed chunk {chunk_num}, Memory: {memory_mb:.0f}MB, Words: {len(word_counts):,}")
+            
+            # Add to buffer
+            buffer += chunk
+            
+            # Find last complete line to avoid splitting words
+            last_newline = buffer.rfind('\n')
+            if last_newline != -1:
+                # Process complete lines
+                complete_text = buffer[:last_newline]
+                buffer = buffer[last_newline + 1:]
+                
+                process_text_chunk(complete_text, word_counts, delimiter_pattern)
+            
+            # If buffer gets too large (no newlines), process anyway
+            if len(buffer) > chunk_size_bytes * 2:
+                process_text_chunk(buffer, word_counts, delimiter_pattern)
+                buffer = ""
+    
+    return word_counts
+
+
+def process_text_chunk(text, word_counts, delimiter_pattern):
+    """Process a chunk of text and update word counts."""
+    if not text.strip():
+        return
+    
+    # Split on special tokens if needed
+    if delimiter_pattern:
+        text_chunks = re.split(delimiter_pattern, text)
+    else:
+        text_chunks = [text]
+    
+    # Pre-tokenize each chunk
+    for chunk in text_chunks:
+        if not chunk:
+            continue
+        
+        for match in re.finditer(PAT, chunk):
+            try:
+                pre_token_bytes = match.group().encode('utf-8')
+                word_tuple = tuple(pre_token_bytes)
+                word_counts[word_tuple] += 1
+            except (UnicodeEncodeError, MemoryError):
+                # Skip problematic tokens
+                continue
+
+
 def train_bpe_with_progress(input_path, vocab_size, special_tokens, parallel=True, num_processes=None):
     """
     Train BPE tokenizer with simple console progress tracking.
@@ -40,9 +127,13 @@ def train_bpe_with_progress(input_path, vocab_size, special_tokens, parallel=Tru
     pre_start = time.time()
     
     file_size = os.path.getsize(input_path)
-    use_parallel = parallel and num_processes > 1 and file_size > 1024 * 1024
+    file_size_gb = file_size / (1024**3)
     
-    if use_parallel:
+    # Use streaming for large files (>5GB) to avoid memory issues
+    if file_size_gb > 5.0:
+        print(f"   Large file detected ({file_size_gb:.1f}GB), using memory-efficient streaming")
+        word_counts = stream_process_file(input_path, special_tokens, chunk_size_mb=50)
+    elif parallel and num_processes > 1 and file_size > 1024 * 1024:
         print(f"   Using {num_processes} processes for parallel pre-tokenization")
         word_counts = Counter()
         split_token = special_tokens[0] if special_tokens else "<|endoftext|>"
@@ -63,26 +154,11 @@ def train_bpe_with_progress(input_path, vocab_size, special_tokens, parallel=Tru
                 for word_tuple, count in chunk_word_counts.items():
                     word_counts[word_tuple] += count
         else:
-            use_parallel = False
-    
-    if not use_parallel:
-        print("   Using serial pre-tokenization")
-        text = read_text_file(input_path)
-        
-        if special_tokens:
-            delimiter_pattern = "|".join(re.escape(token) for token in special_tokens)
-            text_chunks = re.split(delimiter_pattern, text)
-        else:
-            text_chunks = [text]
-        
-        word_counts = Counter()
-        for chunk in text_chunks:
-            if not chunk:
-                continue
-            for match in re.finditer(PAT, chunk):
-                pre_token_bytes = match.group().encode('utf-8')
-                word_tuple = tuple(pre_token_bytes)
-                word_counts[word_tuple] += 1
+            # Fall back to streaming for safety
+            word_counts = stream_process_file(input_path, special_tokens, chunk_size_mb=100)
+    else:
+        print("   Using streaming processing for small files")
+        word_counts = stream_process_file(input_path, special_tokens, chunk_size_mb=100)
     
     pre_time = time.time() - pre_start
     unique_words = len(word_counts)
