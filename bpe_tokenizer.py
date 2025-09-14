@@ -167,6 +167,68 @@ def get_byte_pair_counts(word_counts: Dict[Tuple[int, ...], int]) -> Counter:
     return pair_counts
 
 
+def update_pair_counts_after_merge(
+    pair_counts: Counter, 
+    word_counts: Dict[Tuple[int, ...], int], 
+    old_word_counts: Dict[Tuple[int, ...], int],
+    merged_pair: Tuple[int, int], 
+    new_token_id: int
+) -> Counter:
+    """
+    Incrementally update pair counts after a merge operation.
+    
+    This is the key optimization: instead of recalculating all pair counts,
+    we only update the counts for pairs that are affected by the merge.
+    
+    Args:
+        pair_counts: Current pair counts to update
+        word_counts: New word counts after merge
+        old_word_counts: Word counts before merge  
+        merged_pair: The pair that was merged (A, B)
+        new_token_id: The new token ID C that replaced (A, B)
+        
+    Returns:
+        Updated pair_counts
+    """
+    a, b = merged_pair
+    c = new_token_id
+    
+    # Find all words that were affected by the merge
+    affected_old_words = set()
+    affected_new_words = set()
+    
+    # Collect old words that contained the merged pair
+    for word_tuple in old_word_counts:
+        if len(word_tuple) >= 2:
+            for i in range(len(word_tuple) - 1):
+                if word_tuple[i] == a and word_tuple[i + 1] == b:
+                    affected_old_words.add(word_tuple)
+                    break
+    
+    # Collect corresponding new words
+    for word_tuple in word_counts:
+        if c in word_tuple:
+            affected_new_words.add(word_tuple)
+    
+    # Remove pair counts from old affected words
+    for word_tuple in affected_old_words:
+        count = old_word_counts[word_tuple]
+        for i in range(len(word_tuple) - 1):
+            pair = (word_tuple[i], word_tuple[i + 1])
+            pair_counts[pair] -= count
+            if pair_counts[pair] <= 0:
+                del pair_counts[pair]
+    
+    # Add pair counts from new affected words
+    for word_tuple in affected_new_words:
+        count = word_counts[word_tuple]
+        for i in range(len(word_tuple) - 1):
+            pair = (word_tuple[i], word_tuple[i + 1])
+            pair_counts[pair] += count
+    
+    return pair_counts
+
+
 def merge_pair_in_word_counts(word_counts: Dict[Tuple[int, ...], int], pair: Tuple[int, int], new_token_id: int) -> Dict[Tuple[int, ...], int]:
     """
     Merge all instances of a specific byte pair in word counts dictionary.
@@ -360,6 +422,119 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: List[str], paral
         # Update word counts by merging this pair
         word_counts = merge_pair_in_word_counts(word_counts, most_frequent_pair, new_token_id)
         
+    return vocab, merges
+
+
+def train_bpe_optimized(input_path: str, vocab_size: int, special_tokens: List[str] = [], parallel: bool = True, num_processes: int = None) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
+    """
+    Train a BPE tokenizer with optimized incremental pair count updates.
+    
+    This optimized version maintains a cache of pair counts and only updates
+    the counts for pairs affected by each merge, dramatically speeding up
+    the merge phase compared to the naive approach.
+    
+    Args:
+        input_path: Path to training text file
+        vocab_size: Target vocabulary size
+        special_tokens: List of special tokens to include in vocabulary
+        parallel: Whether to use parallel processing for pre-tokenization
+        num_processes: Number of processes to use (default: cpu_count())
+        
+    Returns:
+        Tuple of (vocab, merges) where:
+        - vocab: Dict mapping token IDs to their byte representation
+        - merges: List of merge operations as (token1_bytes, token2_bytes) tuples
+    """
+    
+    # Set number of processes
+    if num_processes is None:
+        num_processes = cpu_count()
+    
+    # Step 1: Pre-tokenize text (same as before)
+    file_size = os.path.getsize(input_path)
+    use_parallel = parallel and num_processes > 1 and file_size > 1024 * 1024
+    
+    if use_parallel:
+        word_counts = Counter()
+        split_token = special_tokens[0] if special_tokens else "<|endoftext|>"
+        split_token_bytes = split_token.encode('utf-8')
+        
+        with open(input_path, 'rb') as f:
+            boundaries = find_chunk_boundaries(f, num_processes, split_token_bytes)
+        
+        if len(boundaries) > 2:
+            chunk_args = []
+            for start, end in zip(boundaries[:-1], boundaries[1:]):
+                chunk_args.append((input_path, start, end, special_tokens))
+            
+            with Pool(num_processes) as pool:
+                chunk_results = pool.map(process_chunk, chunk_args)
+            
+            for chunk_word_counts in chunk_results:
+                for word_tuple, count in chunk_word_counts.items():
+                    word_counts[word_tuple] += count
+        else:
+            word_counts = read_text_file(input_path, special_tokens)
+    else:
+        word_counts = read_text_file(input_path, special_tokens)
+    
+    # Step 2: Initialize vocabulary 
+    vocab = {}
+    for i in range(256):
+        vocab[i] = bytes([i])
+    
+    next_token_id = 256
+    for special_token in special_tokens:
+        vocab[next_token_id] = special_token.encode('utf-8')
+        next_token_id += 1
+    
+    merges = []
+    
+    # Step 3: OPTIMIZED merge phase with incremental pair count updates
+    # Initialize pair counts cache - this is the key optimization!
+    pair_counts = get_byte_pair_counts(word_counts)
+    
+    while len(vocab) < vocab_size:
+        # No need to recalculate all pair counts! We maintain them incrementally
+        if not pair_counts:
+            break
+            
+        # Find the most frequent pair with deterministic tie-breaking
+        max_frequency = pair_counts.most_common(1)[0][1]
+        max_pairs = [(pair, count) for pair, count in pair_counts.items() if count == max_frequency]
+        
+        # Break ties by preferring lexicographically greater pair based on byte content
+        def get_pair_bytes(pair):
+            token_id1, token_id2 = pair
+            bytes1 = vocab[token_id1]
+            bytes2 = vocab[token_id2]
+            return (bytes1, bytes2)
+        
+        max_pairs.sort(key=lambda x: get_pair_bytes(x[0]), reverse=True)
+        most_frequent_pair = max_pairs[0][0]
+        
+        # Store the old word counts for incremental update
+        old_word_counts = dict(word_counts)
+        
+        # Add new token to vocabulary
+        token1_bytes = vocab[most_frequent_pair[0]]
+        token2_bytes = vocab[most_frequent_pair[1]]
+        new_token_bytes = token1_bytes + token2_bytes
+        vocab[next_token_id] = new_token_bytes
+        
+        # Record the merge
+        merges.append((token1_bytes, token2_bytes))
+        
+        # Update word counts by merging this pair
+        word_counts = merge_pair_in_word_counts(word_counts, most_frequent_pair, next_token_id)
+        
+        # KEY OPTIMIZATION: Incrementally update pair counts instead of recalculating all
+        pair_counts = update_pair_counts_after_merge(
+            pair_counts, word_counts, old_word_counts, most_frequent_pair, next_token_id
+        )
+        
+        next_token_id += 1
+    
     return vocab, merges
 
 
