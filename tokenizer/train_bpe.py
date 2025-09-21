@@ -17,7 +17,7 @@ from collections import Counter
 from pathlib import Path
 # All training utilities are now defined in this file
 # Import regex pattern from our new tokenizer module  
-from .tokenizer import PAT
+from tokenizer.tokenizer import PAT
 from multiprocessing import Pool, cpu_count
 import regex as re
 from typing import Dict, List, Tuple, BinaryIO
@@ -182,10 +182,15 @@ def get_byte_pair_counts(word_counts: Dict[Tuple[int, ...], int]) -> Counter:
 
 def merge_pair_in_word_counts(word_counts: Dict[Tuple[int, ...], int], pair: Tuple[int, int], new_token_id: int) -> Dict[Tuple[int, ...], int]:
     """
-    Merge all instances of a specific byte pair in word counts dictionary.
+    OPTIMIZED: Merge all instances of a specific byte pair in word counts dictionary.
     
     This function finds every occurrence of the specified pair in each word
     and replaces it with a single new token ID, preserving the word counts.
+    
+    PERFORMANCE OPTIMIZATIONS:
+    - Skip words that don't contain the target pair (fast path)
+    - Use in-place list operations to reduce memory allocations
+    - Minimize tuple/list conversions
     
     Args:
         word_counts: Dict mapping word tuples to their occurrence counts
@@ -196,27 +201,39 @@ def merge_pair_in_word_counts(word_counts: Dict[Tuple[int, ...], int], pair: Tup
         Updated word_counts dictionary with the pair merged in all words
     """
     new_word_counts = {}
+    pair_a, pair_b = pair
     
     for word_tuple, count in word_counts.items():
-        # Convert tuple to list for easier manipulation
+        # OPTIMIZATION: Quick check for words that can't contain the pair
+        if len(word_tuple) < 2 or pair_a not in word_tuple or pair_b not in word_tuple:
+            new_word_counts[word_tuple] = count
+            continue
+        
+        # OPTIMIZATION: More sophisticated pair existence check
+        contains_pair = False
+        for i in range(len(word_tuple) - 1):
+            if word_tuple[i] == pair_a and word_tuple[i + 1] == pair_b:
+                contains_pair = True
+                break
+        
+        if not contains_pair:
+            # FAST PATH: Word doesn't contain pair, keep as-is
+            new_word_counts[word_tuple] = count
+            continue
+        
+        # SLOW PATH: Word contains pair, perform merge with in-place operations
         word_list = list(word_tuple)
-        new_word = []
         i = 0
         
-        while i < len(word_list):
-            # Check if we can form the target pair at current position
-            if i < len(word_list) - 1 and word_list[i] == pair[0] and word_list[i + 1] == pair[1]:
-                # Found the target pair, replace with new token ID
-                new_word.append(new_token_id)
-                i += 2  # Skip both elements of the pair
+        while i < len(word_list) - 1:
+            if word_list[i] == pair_a and word_list[i + 1] == pair_b:
+                # OPTIMIZATION: Replace pair with new token using list slicing
+                word_list[i:i+2] = [new_token_id]
+                # No need to increment i since we just shortened the list
             else:
-                # Not a pair or no pair possible, keep current element
-                new_word.append(word_list[i])
                 i += 1
         
-        # Convert back to tuple and preserve count
-        new_word_tuple = tuple(new_word)
-        new_word_counts[new_word_tuple] = count
+        new_word_counts[tuple(word_list)] = count
     
     return new_word_counts
 
@@ -892,7 +909,7 @@ def train_bpe_tinystories(data_path="../data/TinyStoriesV2-GPT4-train.txt", voca
 
 if __name__ == "__main__":
     # Check if data file exists
-    data_file = "../data/owt_train.txt"
+    data_file = "../data/TinyStoriesV2-GPT4-valid.txt"
     if not os.path.exists(data_file):
         print(f"Error: Data file {data_file} not found!")
         print("Please ensure the TinyStories dataset is available at ../data/")
@@ -915,7 +932,7 @@ if __name__ == "__main__":
     
     # Test the tokenizer with a sample
     print("\n=== Testing Tokenizer ===")
-    from bpe_tokenizer import Tokenizer
+    from tokenizer.tokenizer import Tokenizer
     
     tokenizer = Tokenizer(vocab, merges, special_tokens=["<|endoftext|>"])
     
