@@ -1842,7 +1842,7 @@ def get_tokenizer(
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
     
-    from bpe_tokenizer import Tokenizer
+    from tokenizer import Tokenizer
     
     return Tokenizer(vocab, merges, special_tokens)
 
@@ -1883,6 +1883,6 @@ def run_train_bpe(
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
     
-    from bpe_tokenizer import train_bpe
+    from tokenizer import train_bpe
     
     return train_bpe(str(input_path), vocab_size, special_tokens)

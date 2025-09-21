@@ -27,7 +27,7 @@ from tests.adapters import (
     TransformerLM,
     run_load_checkpoint
 )
-from bpe_tokenizer import Tokenizer
+from tokenizer import Tokenizer
 
 
 def apply_temperature_scaling(logits: torch.Tensor, temperature: float) -> torch.Tensor:

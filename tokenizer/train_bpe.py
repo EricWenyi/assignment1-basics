@@ -15,7 +15,7 @@ import pickle
 import hashlib
 from collections import Counter
 from pathlib import Path
-from bpe_tokenizer import (
+from .bpe_tokenizer import (
     train_bpe, train_bpe_optimized, read_text_file, process_chunk, find_chunk_boundaries,
     get_byte_pair_counts, merge_pair_in_word_counts, update_pair_counts_after_merge, PAT
 )
@@ -50,7 +50,7 @@ def get_file_hash(file_path):
 
 def get_cache_path(file_path, special_tokens):
     """Generate cache file path based on input file and configuration."""
-    cache_dir = Path("bpe_cache")
+    cache_dir = Path("tokenizer/cache")
     cache_dir.mkdir(exist_ok=True)
     
     # Create cache filename based on input file and special tokens
@@ -141,7 +141,7 @@ def load_pretokenization_cache(file_path, special_tokens):
 
 def list_cache_files():
     """List all cached pre-tokenization files."""
-    cache_dir = Path("bpe_cache")
+    cache_dir = Path("tokenizer/cache")
     if not cache_dir.exists():
         print("No cache directory found")
         return []
@@ -174,7 +174,7 @@ def list_cache_files():
 
 def clean_cache(max_age_hours=168):  # Default: 1 week
     """Clean old cache files."""
-    cache_dir = Path("bpe_cache")
+    cache_dir = Path("tokenizer/cache")
     if not cache_dir.exists():
         return
     
@@ -538,7 +538,7 @@ def train_bpe_tinystories(data_path="../data/TinyStoriesV2-GPT4-train.txt", voca
         print(f"Longest token: {longest_token!r} (length: {longest_length} bytes)")
     
     # Serialize vocabulary to JSON
-    vocab_file = "tinystories_vocab.json"
+    vocab_file = "tokenizer/outputs/tinystories_vocab.json"
     print(f"Saving vocabulary to {vocab_file}")
     
     # Convert vocab to JSON-serializable format (token_str -> token_id)
@@ -556,7 +556,7 @@ def train_bpe_tinystories(data_path="../data/TinyStoriesV2-GPT4-train.txt", voca
         json.dump(vocab_json, f, ensure_ascii=False, indent=2)
     
     # Serialize merges to text file
-    merges_file = "tinystories_merges.txt"
+    merges_file = "tokenizer/outputs/tinystories_merges.txt"
     print(f"Saving merges to {merges_file}")
     
     with open(merges_file, 'w', encoding='utf-8') as f:
@@ -575,8 +575,8 @@ def train_bpe_tinystories(data_path="../data/TinyStoriesV2-GPT4-train.txt", voca
     print(f"Merges saved to {merges_file}")
     
     # Also save in native Python format (pickle) for exact type preservation
-    vocab_pickle_file = "tinystories_vocab.pkl"
-    merges_pickle_file = "tinystories_merges.pkl"
+    vocab_pickle_file = "tokenizer/outputs/tinystories_vocab.pkl"
+    merges_pickle_file = "tokenizer/outputs/tinystories_merges.pkl"
     
     with open(vocab_pickle_file, 'wb') as f:
         pickle.dump(vocab, f)
