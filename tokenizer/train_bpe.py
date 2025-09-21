@@ -909,7 +909,7 @@ def train_bpe_tinystories(data_path="../data/TinyStoriesV2-GPT4-train.txt", voca
 
 if __name__ == "__main__":
     # Check if data file exists
-    data_file = "../data/TinyStoriesV2-GPT4-valid.txt"
+    data_file = "../data/owt_train.txt"
     if not os.path.exists(data_file):
         print(f"Error: Data file {data_file} not found!")
         print("Please ensure the TinyStories dataset is available at ../data/")
