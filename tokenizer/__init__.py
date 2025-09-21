@@ -31,24 +31,24 @@ Usage:
 """
 
 # Import main classes and functions for easy access
-from .bpe_tokenizer import (
+from .tokenizer import (
     Tokenizer,
-    train_bpe,
-    train_bpe_optimized,
-    read_text_file,
-    get_byte_pair_counts,
-    merge_pair_in_word_counts,
-    update_pair_counts_after_merge,
     PAT
 )
 
 from .train_bpe import (
+    train_bpe,
     train_bpe_tinystories,
-    train_bpe_with_progress,
+    read_text_file,
+    get_byte_pair_counts,
+    merge_pair_in_word_counts,
+    update_pair_counts_after_merge,
     get_file_hash,
     save_pretokenization_cache,
     load_pretokenization_cache,
-    stream_process_file
+    stream_process_file,
+    find_chunk_boundaries,
+    process_chunk
 )
 
 __version__ = "1.0.0"
@@ -58,15 +58,15 @@ __all__ = [
     
     # Training functions
     "train_bpe",
-    "train_bpe_optimized", 
     "train_bpe_tinystories",
-    "train_bpe_with_progress",
     
     # Core BPE functions
     "read_text_file",
     "get_byte_pair_counts",
     "merge_pair_in_word_counts",
     "update_pair_counts_after_merge",
+    "find_chunk_boundaries",
+    "process_chunk",
     
     # Caching functions
     "get_file_hash",
