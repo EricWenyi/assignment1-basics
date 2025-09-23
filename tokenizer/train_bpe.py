@@ -300,7 +300,7 @@ def update_pair_counts_after_merge(
     return pair_counts
 
 
-def train_bpe(input_path: str, vocab_size: int, special_tokens: List[str], parallel: bool = True, num_processes: int = None, show_progress: bool = True) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
+def train_bpe(input_path: str, vocab_size: int, special_tokens: List[str], parallel: bool = True, num_processes: int = None, show_progress: bool = True, checkpoint_every: int = 100, checkpoint_dir: str = "tokenizer/checkpoints") -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
     """
     Train a BPE tokenizer with optimized algorithm and optional progress tracking.
     
@@ -310,6 +310,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: List[str], paral
     - Pre-tokenization caching for faster re-runs
     - Memory-efficient streaming for large files
     - Parallel processing for faster pre-tokenization
+    - Automatic checkpointing to prevent data loss on long runs
     
     Args:
         input_path: Path to the training text file
@@ -318,6 +319,8 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: List[str], paral
         parallel: Whether to use parallel processing for pre-tokenization (default: True)
         num_processes: Number of processes to use (default: cpu_count())
         show_progress: Whether to show progress tracking (default: True)
+        checkpoint_every: Save checkpoint every N merges (default: 100)
+        checkpoint_dir: Directory to save checkpoints (default: "tokenizer/checkpoints")
         
     Returns:
         Tuple of (vocab, merges) where:
@@ -435,12 +438,28 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: List[str], paral
     last_progress_time = time.time()
     progress_interval = 10  # Print every 10 seconds
     
-    # KEY OPTIMIZATION: Initialize pair counts cache once, then update incrementally
-    if show_progress:
-        print("   Initializing pair counts cache...")
-    pair_counts = get_byte_pair_counts(word_counts)
-    if show_progress:
-        print(f"   Cached {len(pair_counts):,} unique pairs")
+    # Setup checkpointing
+    checkpoint_path = Path(checkpoint_dir)
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
+    
+    # Check for existing checkpoint to resume from
+    resume_checkpoint = find_latest_checkpoint(checkpoint_dir, input_path, vocab_size, special_tokens)
+    
+    if resume_checkpoint:
+        vocab, merges, iteration, next_token_id, word_counts = load_checkpoint(resume_checkpoint)
+        if show_progress:
+            print(f"🔄 Resuming from checkpoint: {resume_checkpoint}")
+            print(f"   Already completed {iteration} merges, vocab size: {len(vocab)}")
+        
+        # Recalculate pair counts from current state
+        pair_counts = get_byte_pair_counts(word_counts)
+    else:
+        # KEY OPTIMIZATION: Initialize pair counts cache once, then update incrementally
+        if show_progress:
+            print("   Initializing pair counts cache...")
+        pair_counts = get_byte_pair_counts(word_counts)
+        if show_progress:
+            print(f"   Cached {len(pair_counts):,} unique pairs")
     
     while len(vocab) < vocab_size:
         iter_start = time.time()
@@ -486,6 +505,13 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: List[str], paral
             pair_counts, word_counts, old_word_counts, most_frequent_pair, new_token_id
         )
         
+        # Checkpoint periodically to prevent data loss
+        if iteration % checkpoint_every == 0:
+            save_checkpoint(checkpoint_dir, input_path, vocab_size, special_tokens, 
+                          vocab, merges, iteration, next_token_id, word_counts)
+            if show_progress:
+                print(f"💾 Checkpoint saved at iteration {iteration}")
+        
         # Progress tracking (only if enabled)
         if show_progress:
             iter_time = time.time() - iter_start
@@ -516,12 +542,17 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: List[str], paral
                       f"Mem: {memory_mb:.0f}MB")
                 last_progress_time = current_time
     
+    # Save final checkpoint
+    save_checkpoint(checkpoint_dir, input_path, vocab_size, special_tokens, 
+                  vocab, merges, iteration, next_token_id, word_counts, is_final=True)
+    
     if show_progress:
         total_time = time.time() - training_start
         print()
         print(f"✅ Training completed in {total_time:.1f}s ({total_time/60:.1f}m)")
         print(f"📊 Final vocab size: {len(vocab):,}")
         print(f"🔗 Total merges: {len(merges):,}")
+        print(f"💾 Final checkpoint saved")
         print()
     
     return vocab, merges
@@ -715,6 +746,182 @@ def clean_cache(max_age_hours=168):  # Default: 1 week
         print("✅ No cache files needed cleaning")
 
 
+# ============================================================================
+# Checkpointing Functions
+# ============================================================================
+
+def save_checkpoint(checkpoint_dir: str, input_path: str, vocab_size: int, special_tokens: List[str],
+                   vocab: Dict[int, bytes], merges: List[Tuple[bytes, bytes]], iteration: int,
+                   next_token_id: int, word_counts: Dict[Tuple[int, ...], int], is_final: bool = False):
+    """Save training checkpoint to prevent data loss on long runs."""
+    
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create checkpoint filename
+    input_name = Path(input_path).stem
+    checkpoint_type = "final" if is_final else f"iter_{iteration:06d}"
+    checkpoint_file = checkpoint_dir / f"bpe_checkpoint_{input_name}_{vocab_size}_{checkpoint_type}.pkl"
+    
+    checkpoint_data = {
+        'input_path': input_path,
+        'vocab_size': vocab_size,
+        'special_tokens': special_tokens,
+        'vocab': vocab,
+        'merges': merges,
+        'iteration': iteration,
+        'next_token_id': next_token_id,
+        'word_counts': word_counts,
+        'timestamp': time.time(),
+        'is_final': is_final,
+        'vocab_size_actual': len(vocab),
+        'merges_count': len(merges)
+    }
+    
+    # Save checkpoint atomically (write to temp file, then rename)
+    temp_file = checkpoint_file.with_suffix('.tmp')
+    try:
+        with open(temp_file, 'wb') as f:
+            pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        temp_file.rename(checkpoint_file)
+        
+        # Keep only recent checkpoints to save space (keep last 3 + final)
+        cleanup_old_checkpoints(checkpoint_dir, input_path, vocab_size, keep_count=3)
+        
+    except Exception as e:
+        if temp_file.exists():
+            temp_file.unlink()
+        raise e
+
+
+def load_checkpoint(checkpoint_file: Path) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]], int, int, Dict[Tuple[int, ...], int]]:
+    """Load training checkpoint."""
+    
+    with open(checkpoint_file, 'rb') as f:
+        checkpoint_data = pickle.load(f)
+    
+    return (
+        checkpoint_data['vocab'],
+        checkpoint_data['merges'],
+        checkpoint_data['iteration'],
+        checkpoint_data['next_token_id'],
+        checkpoint_data['word_counts']
+    )
+
+
+def find_latest_checkpoint(checkpoint_dir: str, input_path: str, vocab_size: int, special_tokens: List[str]) -> Path:
+    """Find the latest checkpoint for resuming training."""
+    
+    checkpoint_dir = Path(checkpoint_dir)
+    if not checkpoint_dir.exists():
+        return None
+    
+    input_name = Path(input_path).stem
+    pattern = f"bpe_checkpoint_{input_name}_{vocab_size}_iter_*.pkl"
+    
+    checkpoints = list(checkpoint_dir.glob(pattern))
+    if not checkpoints:
+        return None
+    
+    # Sort by iteration number (extract from filename)
+    def get_iteration(checkpoint_path):
+        try:
+            # Extract iteration number from filename
+            name = checkpoint_path.stem
+            iter_part = name.split('_iter_')[1]
+            return int(iter_part)
+        except:
+            return 0
+    
+    latest_checkpoint = max(checkpoints, key=get_iteration)
+    
+    # Validate checkpoint
+    try:
+        with open(latest_checkpoint, 'rb') as f:
+            checkpoint_data = pickle.load(f)
+        
+        # Check if checkpoint matches current training parameters
+        if (checkpoint_data['input_path'] == input_path and
+            checkpoint_data['vocab_size'] == vocab_size and
+            checkpoint_data['special_tokens'] == special_tokens):
+            return latest_checkpoint
+    except Exception as e:
+        print(f"⚠️  Warning: Corrupted checkpoint {latest_checkpoint}: {e}")
+        return None
+    
+    return None
+
+
+def cleanup_old_checkpoints(checkpoint_dir: Path, input_path: str, vocab_size: int, keep_count: int = 3):
+    """Clean up old checkpoints, keeping only the most recent ones."""
+    
+    input_name = Path(input_path).stem
+    pattern = f"bpe_checkpoint_{input_name}_{vocab_size}_iter_*.pkl"
+    
+    checkpoints = list(checkpoint_dir.glob(pattern))
+    if len(checkpoints) <= keep_count:
+        return
+    
+    # Sort by iteration number and keep only the most recent
+    def get_iteration(checkpoint_path):
+        try:
+            name = checkpoint_path.stem
+            iter_part = name.split('_iter_')[1]
+            return int(iter_part)
+        except:
+            return 0
+    
+    checkpoints.sort(key=get_iteration, reverse=True)
+    
+    # Remove old checkpoints
+    for old_checkpoint in checkpoints[keep_count:]:
+        try:
+            old_checkpoint.unlink()
+        except Exception as e:
+            print(f"⚠️  Warning: Could not remove old checkpoint {old_checkpoint}: {e}")
+
+
+def list_checkpoints(checkpoint_dir: str = "tokenizer/checkpoints"):
+    """List all available checkpoints."""
+    
+    checkpoint_dir = Path(checkpoint_dir)
+    if not checkpoint_dir.exists():
+        print("No checkpoint directory found")
+        return []
+    
+    checkpoints = list(checkpoint_dir.glob("bpe_checkpoint_*.pkl"))
+    if not checkpoints:
+        print("No checkpoints found")
+        return []
+    
+    print(f"📂 Found {len(checkpoints)} checkpoints:")
+    for checkpoint_file in sorted(checkpoints):
+        try:
+            with open(checkpoint_file, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+            
+            age = time.time() - checkpoint_data['timestamp']
+            age_str = f"{age/3600:.1f}h" if age > 3600 else f"{age/60:.1f}m"
+            
+            checkpoint_type = "FINAL" if checkpoint_data.get('is_final', False) else f"iter {checkpoint_data['iteration']:,}"
+            
+            print(f"  📄 {checkpoint_file.name}")
+            print(f"     Type: {checkpoint_type}")
+            print(f"     Progress: {checkpoint_data['vocab_size_actual']:,}/{checkpoint_data['vocab_size']:,} vocab")
+            print(f"     Merges: {checkpoint_data['merges_count']:,}")
+            print(f"     Age: {age_str}")
+            print()
+            
+        except Exception as e:
+            print(f"  ❌ {checkpoint_file.name} (corrupted: {e})")
+    
+    return checkpoints
+
+
+# ============================================================================
+# Streaming Functions
+# ============================================================================
+
 def stream_process_file(file_path, special_tokens, chunk_size_mb=100):
     """
     Memory-efficient streaming file processing that doesn't load entire file into memory.
@@ -855,8 +1062,12 @@ def train_bpe_tinystories(data_path="../data/TinyStoriesV2-GPT4-train.txt", voca
     except UnicodeDecodeError:
         print(f"Longest token: {longest_token!r} (length: {longest_length} bytes)")
     
+    # Ensure output directory exists
+    output_dir = Path("tokenizer/outputs")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
     # Serialize vocabulary to JSON
-    vocab_file = "tokenizer/outputs/tinystories_vocab.json"
+    vocab_file = output_dir / "tinystories_vocab.json"
     print(f"Saving vocabulary to {vocab_file}")
     
     # Convert vocab to JSON-serializable format (token_str -> token_id)
@@ -874,7 +1085,7 @@ def train_bpe_tinystories(data_path="../data/TinyStoriesV2-GPT4-train.txt", voca
         json.dump(vocab_json, f, ensure_ascii=False, indent=2)
     
     # Serialize merges to text file
-    merges_file = "tokenizer/outputs/tinystories_merges.txt"
+    merges_file = output_dir / "tinystories_merges.txt"
     print(f"Saving merges to {merges_file}")
     
     with open(merges_file, 'w', encoding='utf-8') as f:
@@ -893,8 +1104,8 @@ def train_bpe_tinystories(data_path="../data/TinyStoriesV2-GPT4-train.txt", voca
     print(f"Merges saved to {merges_file}")
     
     # Also save in native Python format (pickle) for exact type preservation
-    vocab_pickle_file = "tokenizer/outputs/tinystories_vocab.pkl"
-    merges_pickle_file = "tokenizer/outputs/tinystories_merges.pkl"
+    vocab_pickle_file = output_dir / "tinystories_vocab.pkl"
+    merges_pickle_file = output_dir / "tinystories_merges.pkl"
     
     with open(vocab_pickle_file, 'wb') as f:
         pickle.dump(vocab, f)
