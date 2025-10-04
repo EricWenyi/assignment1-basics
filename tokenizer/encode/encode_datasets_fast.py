@@ -26,9 +26,13 @@ def load_tokenizer(vocab_path, merges_path):
 
 def process_chunk(args):
     """Process a chunk of text in a separate process"""
-    chunk_data, vocab_path, merges_path, separator, chunk_id, chunk_size_bytes = args
+    file_path, start, end, vocab_path, merges_path, separator, chunk_id = args
 
     start_time = time.time()
+
+    # Load chunk data
+    chunk_data = load_chunk(file_path, start, end)
+    chunk_size_bytes = end - start
 
     # Load tokenizer in worker process
     tokenizer = load_tokenizer(vocab_path, merges_path)
@@ -44,6 +48,10 @@ def process_chunk(args):
         # Handle OpenWebText - split by double newlines
         documents = chunk_data.split('\n\n')
         documents = [doc.strip() for doc in documents if doc.strip() and len(doc) > 100]
+
+    # Free chunk data immediately after splitting
+    del chunk_data
+    gc.collect()
 
     # Batch encode documents for efficiency
     batch_size = 100
@@ -68,48 +76,51 @@ def process_chunk(args):
 
     return tokens, chunk_id, len(documents), processing_time
 
-def read_file_in_chunks(file_path, chunk_size_mb=100):
-    """Read file in chunks using memory mapping for efficiency"""
-    chunks = []
+def get_chunk_boundaries(file_path, chunk_size_mb=100):
+    """Get chunk boundaries without loading data into memory"""
+    chunk_boundaries = []
     file_size = os.path.getsize(file_path)
     chunk_size = chunk_size_mb * 1024 * 1024
 
-    print(f"Reading {file_path} in {chunk_size_mb}MB chunks...")
+    print(f"Computing chunk boundaries for {file_path} ({chunk_size_mb}MB chunks)...")
 
     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            start = 0
-            chunk_id = 0
+        start = 0
+        chunk_id = 0
 
-            while start < file_size:
-                end = min(start + chunk_size, file_size)
+        while start < file_size:
+            end = min(start + chunk_size, file_size)
 
-                # Find a good breaking point (end of line or document)
-                if end < file_size:
-                    # Read a bit more to find line break
-                    f.seek(end)
-                    extra = f.read(10000)  # Read up to 10KB more
-                    if '\n' in extra:
-                        line_break = extra.find('\n')
-                        end += line_break + 1
-                    elif '<|endoftext|>' in extra:
-                        token_end = extra.find('<|endoftext|>') + len('<|endoftext|>')
-                        end += token_end
+            # Find a good breaking point (end of line or document)
+            if end < file_size:
+                # Read a bit more to find line break
+                f.seek(end)
+                extra = f.read(10000)  # Read up to 10KB more
+                if '\n' in extra:
+                    line_break = extra.find('\n')
+                    end += line_break + 1
+                elif '<|endoftext|>' in extra:
+                    token_end = extra.find('<|endoftext|>') + len('<|endoftext|>')
+                    end += token_end
 
-                # Extract chunk
-                mm.seek(start)
-                chunk_data = mm.read(end - start).decode('utf-8', errors='ignore')
-                chunk_size_bytes = end - start
-                chunks.append((chunk_data, start, end, chunk_id, chunk_size_bytes))
+            # Store only boundaries, not data
+            chunk_boundaries.append((start, end, chunk_id))
 
-                start = end
-                chunk_id += 1
+            start = end
+            chunk_id += 1
 
-                if chunk_id % 10 == 0:
-                    print(f"  Read {chunk_id} chunks ({start/(1024*1024*1024):.1f}GB processed)")
+            if chunk_id % 10 == 0:
+                print(f"  Computed {chunk_id} boundaries ({start/(1024*1024*1024):.1f}GB)")
 
-    print(f"Split into {len(chunks)} chunks")
-    return chunks
+    print(f"Total chunks: {len(chunk_boundaries)}")
+    return chunk_boundaries, file_size
+
+def load_chunk(file_path, start, end):
+    """Load a single chunk from file"""
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        f.seek(start)
+        chunk_data = f.read(end - start)
+    return chunk_data
 
 def progress_monitor(futures, total_chunks, start_time, file_size):
     """Monitor progress of parallel processing in separate thread"""
@@ -164,27 +175,29 @@ def progress_monitor(futures, total_chunks, start_time, file_size):
 def encode_file_parallel(file_path, vocab_path, merges_path, output_path, separator=None, max_workers=None):
     """Encode file using parallel processing with real-time progress tracking"""
     if max_workers is None:
-        max_workers = min(cpu_count(), 8)  # Don't use too many processes
+        max_workers = min(cpu_count() - 2, 6)  # Limit workers to reduce memory
 
     print(f"Encoding {file_path} with {max_workers} processes")
     start_time = time.time()
-    file_size = os.path.getsize(file_path)
 
-    # Read file in chunks
-    chunks = read_file_in_chunks(file_path, chunk_size_mb=200)  # Larger chunks for better efficiency
+    # Get chunk boundaries (not data)
+    chunk_boundaries, file_size = get_chunk_boundaries(file_path, chunk_size_mb=100)
 
     # Prepare arguments for parallel processing
     chunk_args = []
-    for chunk_data, start, end, chunk_id, chunk_size_bytes in chunks:
-        chunk_args.append((chunk_data, vocab_path, merges_path, separator, chunk_id, chunk_size_bytes))
+    for start, end, chunk_id in chunk_boundaries:
+        chunk_args.append((file_path, start, end, vocab_path, merges_path, separator, chunk_id))
 
     print(f"Processing {len(chunk_args)} chunks in parallel...")
     print(f"File size: {file_size/(1024*1024*1024):.2f} GB")
     print("="*60)
 
+    # Create temp directory for chunk files
+    temp_dir = tempfile.mkdtemp(prefix='encode_chunks_')
+    print(f"Temp directory: {temp_dir}")
+
     # Process chunks in parallel with real-time progress tracking
-    all_tokens = []
-    chunk_results = {}
+    chunk_files = {}
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         # Submit all jobs
@@ -193,21 +206,29 @@ def encode_file_parallel(file_path, vocab_path, merges_path, output_path, separa
         # Start progress monitoring in separate thread
         monitor_thread = threading.Thread(
             target=progress_monitor,
-            args=(futures, len(chunks), start_time, file_size)
+            args=(futures, len(chunk_boundaries), start_time, file_size)
         )
         monitor_thread.daemon = True
         monitor_thread.start()
 
-        # Collect results as they complete
+        # Collect results as they complete and save to individual chunk files
         total_docs = 0
         total_processing_time = 0
 
         for future in as_completed(futures):
             try:
                 tokens, chunk_id, docs, proc_time = future.result()
-                chunk_results[chunk_id] = tokens
+
+                # Save chunk to temp file immediately
+                chunk_file = os.path.join(temp_dir, f'chunk_{chunk_id:06d}.npy')
+                np.save(chunk_file, np.array(tokens, dtype=np.uint16))
+                chunk_files[chunk_id] = chunk_file
+
                 total_docs += docs
                 total_processing_time += proc_time
+
+                # Free memory immediately
+                del tokens
 
             except Exception as e:
                 print(f"Error processing chunk: {e}")
@@ -215,10 +236,72 @@ def encode_file_parallel(file_path, vocab_path, merges_path, output_path, separa
         # Wait for monitor thread to finish
         monitor_thread.join(timeout=1)
 
-    # Reassemble tokens in correct order
-    print("\nReassembling tokens in correct order...")
-    for chunk_id in sorted(chunk_results.keys()):
-        all_tokens.extend(chunk_results[chunk_id])
+    # Count total tokens first
+    print("\nCounting total tokens...")
+    total_tokens = 0
+    for chunk_id in sorted(chunk_files.keys()):
+        chunk_file = chunk_files[chunk_id]
+        chunk_tokens = np.load(chunk_file, mmap_mode='r')
+        total_tokens += len(chunk_tokens)
+        del chunk_tokens
+
+    print(f"Total tokens: {total_tokens:,} ({total_tokens/1e9:.2f}B)")
+
+    # Write .npy file header manually, then append chunks
+    print(f"Writing chunks to {output_path}...")
+
+    import struct
+
+    # Write .npy format header
+    with open(output_path, 'wb') as f:
+        # .npy v1.0 format
+        magic = b'\x93NUMPY'
+        version = b'\x01\x00'
+
+        # Header dict
+        header_dict = {
+            'descr': '<u2',  # little-endian uint16
+            'fortran_order': False,
+            'shape': (total_tokens,)
+        }
+        header_str = str(header_dict).replace("'", '"').replace('(', '(,') if total_tokens > 0 else str(header_dict).replace("'", '"')
+        header_str = "{'descr': '<u2', 'fortran_order': False, 'shape': (%d,), }" % total_tokens
+        header_bytes = header_str.encode('ascii')
+
+        # Pad header to 64-byte boundary
+        header_len = len(header_bytes) + 1  # +1 for newline
+        padding_len = (64 - (len(magic) + len(version) + 2 + header_len) % 64) % 64
+        header_bytes += b' ' * padding_len + b'\n'
+
+        # Write header
+        f.write(magic)
+        f.write(version)
+        f.write(struct.pack('<H', len(header_bytes)))
+        f.write(header_bytes)
+
+        # Write chunks one at a time
+        write_pos = 0
+        for chunk_id in sorted(chunk_files.keys()):
+            chunk_file = chunk_files[chunk_id]
+            chunk_tokens = np.load(chunk_file)  # Load one chunk at a time
+
+            # Write chunk data
+            chunk_tokens.tofile(f)
+            write_pos += len(chunk_tokens)
+
+            # Free memory immediately
+            del chunk_tokens
+            gc.collect()
+
+            if (chunk_id + 1) % 10 == 0:
+                print(f"  Written {chunk_id + 1}/{len(chunk_files)} chunks ({write_pos:,} tokens, {write_pos/1e9:.2f}B)")
+
+    final_token_count = total_tokens
+
+    # Clean up temp files
+    print("Cleaning up temp files...")
+    import shutil
+    shutil.rmtree(temp_dir)
 
     total_time = time.time() - start_time
 
@@ -227,15 +310,10 @@ def encode_file_parallel(file_path, vocab_path, merges_path, output_path, separa
     print("="*60)
     print(f"Total time: {total_time/60:.1f} minutes")
     print(f"Total documents: {total_docs:,}")
-    print(f"Total tokens: {len(all_tokens):,}")
+    print(f"Total tokens: {final_token_count:,}")
     print(f"File throughput: {file_size/total_time/1024/1024:.0f} MB/second")
-    print(f"Avg processing time per chunk: {total_processing_time/len(chunks):.1f}s")
+    print(f"Avg processing time per chunk: {total_processing_time/len(chunk_boundaries):.1f}s")
     print(f"Parallelization efficiency: {total_processing_time/total_time/max_workers*100:.1f}%")
-
-    # Save as uint16 numpy array
-    print("Converting to uint16 and saving...")
-    token_array = np.array(all_tokens, dtype=np.uint16)
-    np.save(output_path, token_array)
 
     # Verify
     saved_size = os.path.getsize(output_path) / (1024*1024)
@@ -243,7 +321,7 @@ def encode_file_parallel(file_path, vocab_path, merges_path, output_path, separa
     print(f"Output size: {saved_size:.1f} MB")
     print(f"Compression: {file_size/1024/1024/saved_size:.1f}x")
 
-    return len(all_tokens)
+    return final_token_count
 
 def main():
     print("=== Fast Dataset Encoding Script ===\n")
@@ -269,26 +347,7 @@ def main():
 
     total_start = time.time()
 
-    # Encode TinyStories
-    if os.path.exists(tinystories_path):
-        print("\n" + "="*60)
-        print("ENCODING TINYSTORIES DATASET")
-        print("="*60)
-
-        ts_tokens = encode_file_parallel(
-            tinystories_path,
-            tinystories_vocab,
-            tinystories_merges,
-            ts_output,
-            separator="<|endoftext|>",
-            max_workers=6  # Leave some cores for system
-        )
-
-        # Force garbage collection
-        gc.collect()
-
-        print(f"TinyStories completed: {ts_tokens:,} tokens")
-
+    # Skip TinyStories - already completed
     # Encode OpenWebText
     if os.path.exists(owt_path):
         print("\n" + "="*60)
@@ -300,8 +359,7 @@ def main():
             owt_vocab,
             owt_merges,
             owt_output,
-            separator=None,
-            max_workers=6
+            separator=None
         )
 
         print(f"OpenWebText completed: {owt_tokens:,} tokens")
