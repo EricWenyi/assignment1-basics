@@ -196,45 +196,51 @@ def encode_file_parallel(file_path, vocab_path, merges_path, output_path, separa
     temp_dir = tempfile.mkdtemp(prefix='encode_chunks_')
     print(f"Temp directory: {temp_dir}")
 
-    # Process chunks in parallel with real-time progress tracking
+    # Process chunks in BATCHES to avoid result accumulation in memory
     chunk_files = {}
+    total_docs = 0
+    total_processing_time = 0
+
+    batch_size = max_workers * 3  # Process 3x workers at a time
+    num_batches = (len(chunk_args) + batch_size - 1) // batch_size
+
+    print(f"Processing in {num_batches} batches of ~{batch_size} chunks each")
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all jobs
-        futures = [executor.submit(process_chunk, args) for args in chunk_args]
+        for batch_idx in range(num_batches):
+            batch_start = batch_idx * batch_size
+            batch_end = min(batch_start + batch_size, len(chunk_args))
+            batch_args = chunk_args[batch_start:batch_end]
 
-        # Start progress monitoring in separate thread
-        monitor_thread = threading.Thread(
-            target=progress_monitor,
-            args=(futures, len(chunk_boundaries), start_time, file_size)
-        )
-        monitor_thread.daemon = True
-        monitor_thread.start()
+            print(f"\n=== Batch {batch_idx+1}/{num_batches}: Processing chunks {batch_start}-{batch_end-1} ===")
 
-        # Collect results as they complete and save to individual chunk files
-        total_docs = 0
-        total_processing_time = 0
+            # Submit batch jobs
+            futures = [executor.submit(process_chunk, args) for args in batch_args]
 
-        for future in as_completed(futures):
-            try:
-                tokens, chunk_id, docs, proc_time = future.result()
+            # Collect results as they complete
+            for future in as_completed(futures):
+                try:
+                    tokens, chunk_id, docs, proc_time = future.result()
 
-                # Save chunk to temp file immediately
-                chunk_file = os.path.join(temp_dir, f'chunk_{chunk_id:06d}.npy')
-                np.save(chunk_file, np.array(tokens, dtype=np.uint16))
-                chunk_files[chunk_id] = chunk_file
+                    # Save chunk to temp file immediately
+                    chunk_file = os.path.join(temp_dir, f'chunk_{chunk_id:06d}.npy')
+                    np.save(chunk_file, np.array(tokens, dtype=np.uint16))
+                    chunk_files[chunk_id] = chunk_file
 
-                total_docs += docs
-                total_processing_time += proc_time
+                    total_docs += docs
+                    total_processing_time += proc_time
 
-                # Free memory immediately
-                del tokens
+                    # Free memory immediately
+                    del tokens
+                    gc.collect()
 
-            except Exception as e:
-                print(f"Error processing chunk: {e}")
+                except Exception as e:
+                    print(f"Error processing chunk: {e}")
 
-        # Wait for monitor thread to finish
-        monitor_thread.join(timeout=1)
+            # Report progress
+            completed = len(chunk_files)
+            progress = completed / len(chunk_args)
+            print(f"Progress: {completed}/{len(chunk_args)} chunks ({progress*100:.1f}%)")
 
     # Count total tokens first
     print("\nCounting total tokens...")
