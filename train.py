@@ -155,14 +155,14 @@ def get_dtype(dtype_str: str) -> torch.dtype:
 def load_data(data_path: str) -> np.ndarray:
     """Load tokenized data using memory mapping for efficiency."""
     print(f"Loading data from {data_path}")
-    
+
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Data file not found: {data_path}")
-    
-    # Use memory mapping to avoid loading entire dataset into memory
-    data = np.memmap(data_path, dtype=np.int32, mode='r')
-    print(f"Loaded {len(data):,} tokens")
-    
+
+    # Load the numpy file properly (handles dtype automatically)
+    data = np.load(data_path, mmap_mode='r')
+    print(f"Loaded {len(data):,} tokens (dtype: {data.dtype})")
+
     return data
 
 
