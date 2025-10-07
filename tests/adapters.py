@@ -348,17 +348,17 @@ class RotaryPositionalEmbedding(nn.Module):
         # cos/sin shape after indexing: (..., seq_len, d_k/2)
         cos = self.cos_cached[token_positions]  # Shape: (..., seq_len, d_k/2)
         sin = self.sin_cached[token_positions]  # Shape: (..., seq_len, d_k/2)
-        
+
         # Reshape x to separate consecutive pairs for efficient rotation using einops
         # Transform: (..., seq_len, d_k) -> (..., seq_len, d_k/2, 2) where last dim has [even, odd] elements
         # This groups consecutive dimensions into pairs for 2D rotation
         x_reshaped = rearrange(x, '... seq (pairs two) -> ... seq pairs two', two=2)
-        
+
         # Extract even and odd indexed elements from each pair
         # These correspond to x[..., 0::2] and x[..., 1::2] respectively
         x_even = x_reshaped[..., 0]  # Shape: (..., seq_len, d_k/2) - dims 0, 2, 4, ...
         x_odd = x_reshaped[..., 1]   # Shape: (..., seq_len, d_k/2) - dims 1, 3, 5, ...
-        
+
         # Apply the 2D rotation to each pair of dimensions
         # Rotation matrix: [[cos(θ), -sin(θ)], [sin(θ), cos(θ)]]
         # Matrix multiplication gives:
@@ -1134,7 +1134,32 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    # Create MultiHeadSelfAttention with RoPE enabled
+    mha = MultiHeadSelfAttention(
+        d_model=d_model,
+        num_heads=num_heads,
+        max_seq_len=max_seq_len,
+        theta=theta
+    )
+
+    # Load the provided weights into the model
+    mha.W_Q.W.data = q_proj_weight
+    mha.W_K.W.data = k_proj_weight
+    mha.W_V.W.data = v_proj_weight
+    mha.W_O.W.data = o_proj_weight
+
+    # Handle token_positions batch dimension mismatch
+    # If token_positions has batch=1 but in_features has batch=N, expand to match
+    if token_positions is not None:
+        batch_size = in_features.shape[0]
+        if token_positions.shape[0] != batch_size:
+            # Expand batch dimension to match input (positions are same for all batch items)
+            token_positions = token_positions.expand(batch_size, -1)
+
+    # Apply multi-head self-attention with RoPE
+    output = mha(in_features, token_positions)
+
+    return output
 
 
 def run_rope(

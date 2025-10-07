@@ -30,4 +30,7 @@ uv run python train.py \
   --experiment_description "Local test run with mini dataset to validate training infrastructure" \
   --experiment_tags local test validation \
   --device auto \
-  --dtype bfloat16
+  --dtype bfloat16 \
+  --wandb \
+  --wandb_project "transformer-lm-training" \
+  --wandb_run_name "local_test_$(date +%Y%m%d_%H%M%S)"
