@@ -77,6 +77,9 @@ class Tokenizer:
                     merged_token_id = self.vocab_reverse[merged_bytes]
                     self.merge_map[(token_id1, token_id2)] = merged_token_id
         
+        # Track special tokens so downstream code (e.g., decoding) can reference them
+        self.special_tokens = list(special_tokens) if special_tokens else []
+
         # Add special tokens to vocabulary if provided
         if special_tokens:
             for special_token in special_tokens:

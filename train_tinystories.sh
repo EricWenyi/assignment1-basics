@@ -41,3 +41,6 @@ uv run python train.py \
   --experiment_tags tinystories baseline 4layer \
   --device auto \
   --dtype bfloat16
+  --wandb \
+  --wandb_project "transformer-lm-training" \
+  --wandb_run_name "tinystories_test_$(date +%Y%m%d_%H%M%S)"

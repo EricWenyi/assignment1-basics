@@ -49,10 +49,8 @@ class Embedding(nn.Module):
         # that should be included in gradients and optimizer updates
         self.weight = nn.Parameter(torch.empty(num_embeddings, embedding_dim, device=device, dtype=dtype))
 
-        # Initialize the embedding weights using truncated normal distribution
-        # This initialization helps with stable training and prevents vanishing/exploding gradients
-        # trunc_normal_ initializes values from a truncated normal distribution
-        torch.nn.init.trunc_normal_(self.weight)
+        # Initialize embeddings with a small std so initial logits stay bounded
+        torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=0.02)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -118,11 +116,9 @@ class RMSNorm(nn.Module):
         # nn.Parameter wraps a tensor and tells PyTorch this is a learnable parameter
         # that should be included in gradients and optimizer updates
         self.weight = nn.Parameter(torch.empty(d_model, device=device, dtype=dtype))
-        
-        # Initialize the weights using truncated normal distribution
-        # This initialization helps with stable training and prevents vanishing/exploding gradients
-        # trunc_normal_ initializes values from a truncated normal distribution
-        torch.nn.init.trunc_normal_(self.weight)
+
+        # Start RMSNorm as a no-op scale; ones keeps the residual stream unchanged initially
+        torch.nn.init.ones_(self.weight)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -820,11 +816,9 @@ class Linear(nn.Module):
         # nn.Parameter wraps a tensor and tells PyTorch this is a learnable parameter
         # that should be included in gradients and optimizer updates
         self.W = nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
-        
-        # Initialize the weights using truncated normal distribution
-        # This initialization helps with stable training and prevents vanishing/exploding gradients
-        # trunc_normal_ initializes values from a truncated normal distribution
-        torch.nn.init.trunc_normal_(self.W)
+
+        # Use GPT-style small std to avoid extreme logits before training
+        torch.nn.init.trunc_normal_(self.W, mean=0.0, std=0.02)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
